@@ -1,0 +1,190 @@
+module sh.sysl.toml
+
+import sysl.buf.{Buf, buf}
+
+// Turning what the grammar read into the value a caller gets, and the bookkeeping that makes TOML's
+// structure rules answerable.
+//
+// **A TOML document cannot be built the way a JSON one is, and this file is the whole of the
+// difference.** `sysl-lang/json` assembles bottom-up -- a value is finished before it is pushed into
+// the array or object above it -- and its builder says why: filling one in place would mean reaching
+// into an enum's payload and mutating it. TOML has no such luck. `[servers.alpha]` and then, forty
+// lines later, `[servers.beta]` both add to a table that was finished long before, and
+// `[[fruit]]` twice grows an array whose first element is already built.
+//
+// **So nothing is built until the end.** The grammar produces a flat list of *paths*, in the order
+// they were written, and the tree is assembled once from that. Which is not a workaround: TOML's
+// semantics are already stated in terms of paths -- every rule in the specification is about what a
+// path may be after something else has claimed it -- so a reader that keeps paths is a reader that
+// can quote the rule it is enforcing.
+
+/** One step of a path: a name, or a position in an array of tables.
+ *
+ * `[[fruit]]` twice and then `[fruit.variety]` reaches `fruit`, element 1, `variety` -- so a path
+ * has to be able to say *which element*, and a plain list of names cannot. The index is the reader's
+ * own count rather than anything the document wrote, which is why an array of tables is the one
+ * shape TOML cannot express in a single header.
+ */
+private[toml] enum Step
+    Key(name: string)
+    Index(n: usize)
+
+    is_index(self) -> bool = self match
+        Index(_) -> true
+        _ -> false
+end Step
+
+// Paths are compared element by element, so `Step` needs an equality of its own -- a variant that
+// carries something does not get one by rule, and both of these carry something.
+impl Eq for Step
+    eq(self, rhs: Step) -> bool = self match
+        Key(a) -> rhs match
+            Key(b) -> a == b
+            _ -> false
+        Index(a) -> rhs match
+            Index(b) -> a == b
+            _ -> false
+
+/** A place in the document and, where there is one, what was written there.
+ *
+ * **`None` is a table that must exist rather than a missing value**, which is the distinction that
+ * lets `[a]` with nothing under it come out as an empty table instead of vanishing. A header seeds
+ * one of these; a key writes one with `Some`.
+ */
+private[toml] struct Node
+    path: Buf[Step]
+    value: Option[Value]
+
+/** What a path has already been claimed as, which is the only thing TOML's structure rules are
+ * about.
+ *
+ * The specification says a table may not be defined twice, a key may not be reassigned, an inline
+ * table may not be added to, and a dotted key may not later be reopened by a header. Each of those
+ * is a sentence about what a path *already is*, so the reader keeps exactly that and nothing else.
+ */
+private[toml] enum Claim
+    /** A key was assigned a value here. Nothing may go under it or over it again. */
+    Leaf
+
+    /** A `[header]` defined this table. It may be added to by a deeper header, and may not be
+     * defined again.
+     */
+    Header
+
+    /** This table exists only because something deeper was named -- `[a.b]` brings `a` into being.
+     * A later `[a]` is allowed and turns this into a `Header`, which is the one claim that is
+     * *weaker* than what may replace it.
+     */
+    Implicit
+
+    /** A dotted key made this table, as `a.b = 1` makes `a`. It is closed to headers: the
+     * specification says a dotted key may not be used to add to a table defined by a header, and
+     * the reverse is the rule enforced here.
+     */
+    Dotted
+
+    /** The interior of an inline table, which is frozen the moment its brace closes. */
+    Inline
+
+    /** `[[a]]` defined this as an array of tables. Only another `[[a]]` may extend it. */
+    ArrayTables
+end Claim
+
+private[toml] struct Known
+    path: Buf[Step]
+    claim: Claim
+
+/** Whether two paths are the same, which is `Buf`'s own equality with the length checked first. */
+private[toml] same_path(a: Buf[Step], b: Buf[Step]) -> bool =
+    a.len() == b.len() && a.view() == b.view()
+
+/** A copy of `p` with `s` on the end, since a path is extended far more often than it is walked and
+ * every extension has to leave the original alone -- `[a.b]` and `[a.c]` share their first step.
+ */
+private[toml] extended(p: Buf[Step], s: Step) -> Buf[Step]
+    var out: Buf[Step] = buf()
+
+    out.extend(p.view())
+    out.push(s)
+    out
+
+/** The first `n` steps of `p`, which is what every prefix rule is asked about. */
+private[toml] prefix(p: Buf[Step], n: usize) -> Buf[Step]
+    var out: Buf[Step] = buf()
+
+    out.extend(p.view()[0..<n])
+    out
+
+/** The document, assembled from the flat list the grammar left behind.
+ *
+ * The top level is a table whatever the document holds, which is why this takes the list and not a
+ * root node: an empty file is an empty table and there is no path to hang it from.
+ */
+private[toml] assemble(nodes: []const Node) -> Value = group(nodes, 0)
+
+// One level of the tree, from every node whose path is at least `depth` long.
+//
+// **Order is first appearance, which is what makes a document render back the way it was written.**
+// The specification says nothing about the order of a table's keys, so this is a decision -- and it
+// is the same one `sysl-lang/json` made, for the same reason: a format that is read in order to be
+// written back has to keep the order, and nothing else can.
+private group(nodes: []const Node, depth: usize) -> Value
+    var order: Buf[Step] = buf()
+    var indexed = false
+
+    for i in 0..<nodes.len
+        val n = nodes[i]
+
+        if n.path.len() > depth then
+            val s = n.path.at(depth)
+
+            if s.is_index() then indexed = true
+            if !seen(order, s) then order.push(s)
+
+    if indexed then
+        var items: Buf[Value] = buf()
+
+        for i in 0..<order.len() do items.push(child(nodes, depth, order.at(i)))
+
+        return Arr(items)
+
+    var entries: Buf[Entry] = buf()
+
+    for i in 0..<order.len()
+        val s = order.at(i)
+
+        s match
+            Key(name) -> entries.push(Entry(name, child(nodes, depth, s)))
+            Index(_) -> ()
+
+    Table(entries)
+end group
+
+// What sits under one step: the value written there, or the table its children make up.
+private child(nodes: []const Node, depth: usize, s: Step) -> Value
+    var mine: Buf[Node] = buf()
+
+    for i in 0..<nodes.len
+        val n = nodes[i]
+
+        if n.path.len() > depth && n.path.at(depth) == s then mine.push(n)
+
+    // A node whose path stops here carries the answer, unless it is the `None` seed a header
+    // leaves -- in which case the children are the answer and an empty table is what remains if
+    // there are none.
+    for i in 0..<mine.len()
+        val n = mine.at(i)
+
+        if n.path.len() == depth + 1 then
+            n.value match
+                Some(v) -> return v
+                None -> ()
+
+    group(mine.view(), depth + 1)
+end child
+
+private seen(order: Buf[Step], s: Step) -> bool
+    for i in 0..<order.len()
+        if order.at(i) == s then return true
+
+    false

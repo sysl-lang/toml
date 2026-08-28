@@ -1,0 +1,299 @@
+module sh.sysl.toml
+@tests
+
+import sh.sysl.parsing.{Diagnostic, Source, source_of}
+import sysl.buf.{Buf, buf}
+import sysl.math.Float
+import sysl.text.Search
+import sysl.time.{day_of, hour_of, minute_of, month_of, second_of, us_of, year_of}
+
+// The document, or a failure naming what went wrong -- so that a test reads as a claim about TOML
+// rather than as a `match` around one.
+private ok(text: string) -> Value
+    val src = source_of("t.toml", text)
+
+    parse(src) match
+        Ok(v) -> v
+        Err(d) -> panic(s"expected a document, got: ${d.message}")
+
+// What is wrong with a document that should not read. Panics if it reads, since a test asserting a
+// refusal that stopped being one has to fail rather than pass quietly.
+private bad(text: string) -> string
+    val src = source_of("t.toml", text)
+
+    parse(src) match
+        Ok(_) -> panic(s"expected a refusal, but this read: $text")
+        Err(d) -> d.message
+
+private str_at(v: Value, key: string) -> string = v.get(key).unwrap().as_str().unwrap()
+private int_at(v: Value, key: string) -> long = v.get(key).unwrap().as_int().unwrap()
+
+@test("an empty document is an empty table")
+empty_is_a_table()
+    assert(ok("").is_table())
+    assert_eq(ok("").len(), 0usize)
+    assert_eq(ok("\n\n# just a comment\n\n").len(), 0usize)
+
+@test("the scalars read")
+scalars()
+    val v = ok("s = \"hi\"\nn = 42\nx = 3.5\nb = true\n")
+
+    assert_eq(str_at(v, "s"), "hi")
+    assert_eq(int_at(v, "n"), 42)
+    assert_eq(v.get("x").unwrap().as_float().unwrap(), 3.5)
+    assert_eq(v.get("b").unwrap().as_bool().unwrap(), true)
+
+@test("an integer keeps its sign, its separators and its radix")
+integers()
+    val v = ok("a = -17\nb = +99\nc = 1_000_000\nd = 0xdead_beef\ne = 0o755\nf = 0b1010\n")
+
+    assert_eq(int_at(v, "a"), -17)
+    assert_eq(int_at(v, "b"), 99)
+    assert_eq(int_at(v, "c"), 1000000)
+    assert_eq(int_at(v, "d"), 3735928559)
+    assert_eq(int_at(v, "e"), 493)
+    assert_eq(int_at(v, "f"), 10)
+
+@test("a leading zero is a mistake and not an octal")
+no_leading_zero()
+    assert(bad("a = 01\n").contains("leading zero"))
+
+@test("a sign may not go in front of a radix prefix")
+no_signed_radix()
+    assert(bad("a = -0x1\n").contains("sign"))
+
+@test("floats read, including the two with no digits")
+floats()
+    val v = ok("a = 3.14\nb = -0.5\nc = 5e3\nd = 6.02e23\ne = inf\nf = -inf\ng = nan\n")
+
+    assert_eq(v.get("a").unwrap().as_float().unwrap(), 3.14)
+    assert_eq(v.get("c").unwrap().as_float().unwrap(), 5000.0)
+    assert(v.get("e").unwrap().as_float().unwrap().is_infinite())
+    assert(v.get("g").unwrap().as_float().unwrap().is_nan())
+
+@test("a float needs a digit on both sides of its point")
+float_needs_digits()
+    assert(bad("a = 1.\n").contains("digit"))
+    assert(bad("a = .5\n").contains("value"))
+
+@test("an integer and a float are different values")
+int_is_not_float()
+    assert(ok("a = 1\n").get("a").unwrap().is_int())
+    assert(ok("a = 1.0\n").get("a").unwrap().is_float())
+    // `as_float` widens, which is the one place the family bends.
+    assert_eq(ok("a = 1\n").get("a").unwrap().as_float().unwrap(), 1.0)
+
+@test("a basic string decodes its escapes")
+basic_escapes()
+    val v = ok("a = \"tab\\there\"\nb = \"\\u00e9\"\nc = \"\\U0001F600\"\nd = \"q\\\"q\"\n")
+
+    assert_eq(str_at(v, "a"), "tab\there")
+    assert_eq(str_at(v, "b"), "é")
+    assert_eq(str_at(v, "c"), "😀")
+    assert_eq(str_at(v, "d"), "q\"q")
+
+@test("an escape TOML does not have is refused, and the message says which it has")
+unknown_escape()
+    val m = bad("a = \"\\q\"\n")
+
+    assert(m.contains("not an escape"))
+    // `\x` is C's and the toolkit reads it; TOML does not have it.
+    assert(bad("a = \"\\x41\"\n").contains("not an escape"))
+
+@test("a surrogate is not a character a string can hold")
+surrogate_refused()
+    assert(bad("a = \"\\ud800\"\n").contains("not a character"))
+
+@test("a literal string keeps its backslashes")
+literal_string_is_literal()
+    assert_eq(str_at(ok("a = 'C:\\Users\\n'\n"), "a"), "C:\\Users\\n")
+
+@test("a single-line string may not run past the end of the line")
+no_raw_newline()
+    assert(bad("a = \"one\ntwo\"\n").contains("past the end of the line"))
+    assert(bad("a = 'one\ntwo'\n").contains("past the end of the line"))
+
+@test("a multi-line string trims the newline that opens it")
+multiline_opens()
+    assert_eq(str_at(ok("a = \"\"\"\nroses\"\"\"\n"), "a"), "roses")
+    assert_eq(str_at(ok("a = '''\nroses'''\n"), "a"), "roses")
+    assert_eq(str_at(ok("a = \"\"\"roses\"\"\"\n"), "a"), "roses")
+
+@test("a backslash at the end of a line eats the break and the blanks after it")
+line_ending_backslash()
+    assert_eq(str_at(ok("a = \"\"\"one \\\n    two\"\"\"\n"), "a"), "one two")
+
+@test("a multi-line string may end with a quote")
+quote_against_the_delimiter()
+    assert_eq(str_at(ok("a = \"\"\"he said \"\"\"\"\n"), "a"), "he said \"")
+
+@test("a raw control character may not be written into a string")
+control_refused()
+    assert(bad("a = \"\u{1}\"\n").contains("control character"))
+
+@test("arrays hold anything and may be written down a page")
+arrays()
+    val v = ok("a = [1, 2, 3]\nb = [\n  \"x\",  # a comment\n  \"y\",\n]\nc = []\nd = [1, \"two\", [3]]\n")
+
+    assert_eq(v.get("a").unwrap().len(), 3usize)
+    assert_eq(v.get("a").unwrap().at(1).unwrap().as_int().unwrap(), 2)
+    assert_eq(v.get("b").unwrap().len(), 2usize)
+    assert_eq(v.get("c").unwrap().len(), 0usize)
+    assert_eq(v.get("d").unwrap().at(2).unwrap().len(), 1usize)
+
+@test("an inline table is a table")
+inline_tables()
+    val v = ok("p = { x = 1, y = 2 }\nq = {}\n")
+
+    assert_eq(int_at(v.get("p").unwrap(), "x"), 1)
+    assert_eq(v.get("q").unwrap().len(), 0usize)
+
+@test("a table header opens a table")
+headers()
+    val v = ok("[server]\nhost = \"localhost\"\nport = 8080\n")
+    val s = v.get("server").unwrap()
+
+    assert_eq(str_at(s, "host"), "localhost")
+    assert_eq(int_at(s, "port"), 8080)
+
+@test("a header may name a path, and the tables between come into being")
+nested_headers()
+    val v = ok("[a.b.c]\nk = 1\n")
+
+    assert_eq(int_at(v.get("a").unwrap().get("b").unwrap().get("c").unwrap(), "k"), 1)
+
+@test("two headers under one parent both land in it")
+sibling_headers()
+    val v = ok("[a.b]\nx = 1\n[a.c]\ny = 2\n")
+    val a = v.get("a").unwrap()
+
+    assert_eq(a.len(), 2usize)
+    assert_eq(int_at(a.get("b").unwrap(), "x"), 1)
+    assert_eq(int_at(a.get("c").unwrap(), "y"), 2)
+
+@test("a header may not be written twice")
+no_redefinition()
+    assert(bad("[a]\n[a]\n").contains("already"))
+
+@test("a key may not be written twice")
+no_duplicate_key()
+    assert(bad("a = 1\na = 2\n").contains("already"))
+
+@test("a dotted key makes the tables above it")
+dotted_keys()
+    val v = ok("a.b.c = 1\n")
+
+    assert_eq(int_at(v.get("a").unwrap().get("b").unwrap(), "c"), 1)
+
+@test("a quoted key is a name and a dotted key is a path")
+quoted_key_is_a_name()
+    val v = ok("\"a.b\" = 1\nc.d = 2\n")
+
+    assert_eq(int_at(v, "a.b"), 1)
+    assert_eq(int_at(v.get("c").unwrap(), "d"), 2)
+
+@test("an array of tables grows an element per header")
+array_of_tables()
+    val v = ok("[[fruit]]\nname = \"apple\"\n[[fruit]]\nname = \"banana\"\n")
+    val f = v.get("fruit").unwrap()
+
+    assert(f.is_array())
+    assert_eq(f.len(), 2usize)
+    assert_eq(str_at(f.at(0).unwrap(), "name"), "apple")
+    assert_eq(str_at(f.at(1).unwrap(), "name"), "banana")
+
+@test("a header under an array of tables reaches its last element")
+into_the_last_element()
+    val v = ok("[[fruit]]\nname = \"apple\"\n[fruit.physical]\ncolor = \"red\"\n[[fruit]]\nname = \"banana\"\n")
+    val f = v.get("fruit").unwrap()
+
+    assert_eq(f.len(), 2usize)
+    assert_eq(str_at(f.at(0).unwrap().get("physical").unwrap(), "color"), "red")
+    assert(f.at(1).unwrap().get("physical").is_none())
+
+@test("an inline table is closed once it is written")
+inline_is_closed()
+    assert(bad("a = { b = 1 }\n[a.c]\nd = 2\n").contains("inline table"))
+
+@test("a table with nothing in it is still a table")
+empty_table()
+    val v = ok("[a]\n")
+
+    assert(v.get("a").unwrap().is_table())
+    assert_eq(v.get("a").unwrap().len(), 0usize)
+
+@test("the four date and time forms are four values")
+datetimes()
+    val v = ok("a = 1979-05-27T07:32:00Z\nb = 1979-05-27T07:32:00\nc = 1979-05-27\nd = 07:32:00\n")
+
+    v.get("a").unwrap() match
+        OffsetDateTime(dt, o) ->
+            assert_eq(year_of(dt.date), 1979)
+            assert_eq(hour_of(dt.time), 7)
+            assert_eq(o.minutes, 0)
+        _ -> panic("a is an offset date-time")
+
+    v.get("b").unwrap() match
+        DateTime(dt) -> assert_eq(month_of(dt.date), 5)
+        _ -> panic("b is a local date-time")
+
+    v.get("c").unwrap() match
+        Date(d) -> assert_eq(day_of(d), 27)
+        _ -> panic("c is a local date")
+
+    v.get("d").unwrap() match
+        Time(t) -> assert_eq(minute_of(t), 32)
+        _ -> panic("d is a local time")
+
+@test("an offset is kept as it was written")
+offset_is_kept()
+    ok("a = 1979-05-27T00:32:00-07:00\n").get("a").unwrap() match
+        OffsetDateTime(_, o) -> assert_eq(o.minutes, -420)
+        _ -> panic("an offset date-time")
+
+@test("a date and a time may be joined by a space")
+space_joins()
+    ok("a = 1979-05-27 07:32:00\n").get("a").unwrap() match
+        DateTime(_) -> ()
+        _ -> panic("a local date-time")
+
+@test("a date followed by a comment is still a date")
+date_then_comment()
+    ok("a = 1979-05-27 # today\n").get("a").unwrap() match
+        Date(_) -> ()
+        _ -> panic("a local date")
+
+@test("a fraction of a second is read and truncated to what this can hold")
+fractional_seconds()
+    ok("a = 07:32:00.123456789\n").get("a").unwrap() match
+        Time(t) -> assert_eq(us_of(t), 123456)
+        _ -> panic("a local time")
+
+@test("a date that never happened is refused")
+impossible_date()
+    assert(bad("a = 2026-02-30\n").contains("no day"))
+    assert(bad("a = 2026-13-01\n").contains("month"))
+
+@test("only one statement goes on a line")
+one_per_line()
+    assert(bad("a = 1 b = 2\n").contains("newline"))
+
+@test("a document that stops in the middle says where it opened")
+unterminated_says_where()
+    // An array that runs out says what it wanted next and labels the bracket, which is a better
+    // message than "never closed" and is what the grammar reaches first.
+    assert(bad("a = [1, 2\n").contains("`,` or `]`"))
+    assert(bad("a = \"\"\"x\n").contains("never closed"))
+    assert(bad("a = \"x\n").contains("past the end of the line"))
+
+@test("a diagnostic renders against its input")
+renders()
+    val src = source_of("t.toml", "a = 1\nb = @\n")
+
+    parse(src) match
+        Ok(_) -> panic("expected a refusal")
+        Err(d) ->
+            val text = d.render(src)
+
+            assert(text.contains("t.toml"))
+            assert(text.contains("b = @"))

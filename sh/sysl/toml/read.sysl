@@ -1,0 +1,475 @@
+module sh.sysl.toml
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.{Ascii, from_utf8_unchecked, str_builder}
+
+// Reading, which is recursive descent over `sh.sysl.parsing`'s cursor.
+//
+// **Almost nothing about the *lexing* is here.** The cursor, the spans, the digit reader with its
+// underscores and its overflow test, and the diagnostic that quotes the line and points at the place
+// all come from the toolkit. What is written here is TOML: its grammar, and the places where it is
+// narrower or wider than the readers underneath.
+//
+// **The narrowing is done at the call rather than by a flag**, which is the toolkit's own position
+// and the reason a second grammar can disagree with this one. `read_escape` knows fifteen escapes
+// and TOML has nine, so the byte after a backslash is checked here; `read_integer` accepts `0X` and
+// a leading zero and TOML accepts neither, so the digits are read through `read_digits` and the
+// prefix is this file's business.
+
+/** How deep a document may nest before the reader gives up.
+ *
+ * **A recursive-descent reader has the machine's stack for a depth limit, and hostile input knows
+ * it**: `[[[[[…` is one byte per level and there is no error to report once the stack is gone. So
+ * the limit is the reader's, it is a diagnostic like any other, and 128 is far past anything a
+ * configuration file has.
+ */
+const max_depth: usize = 128
+
+/** A document read into a value, or the first thing wrong with it.
+ *
+ * **The caller builds the `Source` and keeps it**, which is why this takes one rather than a string:
+ * a `Diagnostic` names a place by byte offset, and turning that into `config.toml:3:8` with the line
+ * quoted underneath needs the input and its line table.
+ *
+ *     val src = source_of("config.toml", text)
+ *
+ *     parse(src) match
+ *         Ok(v) -> ...
+ *         Err(d) -> print(d.render(src))
+ *
+ * **What comes back is always a table**, because a TOML document is one -- an empty file included.
+ */
+parse(src: Source) -> Result[Value, Diagnostic]
+    var p = Parser(src, scan(src), sets(), buf(), buf(), buf(), buf(), 0)
+
+    // A byte-order mark is not part of the document. It is not part of the grammar either -- TOML
+    // says a file is UTF-8 and says nothing about a BOM -- but every editor on Windows writes one,
+    // so a reader that refuses it refuses files nobody thinks are wrong.
+    p.s.accept_seq([0xefu8, 0xbbu8, 0xbfu8])
+
+    document(&p)?
+    Ok(assemble(p.nodes.view()))
+end parse
+
+/** The reader's state.
+ *
+ * `here` is the table every bare key is written into -- the last `[header]`, or the empty path
+ * before there has been one. `nodes` is the flat list `tree.sysl` assembles from; `known` and
+ * `counts` are what the structure rules are asked.
+ */
+private[toml] struct Parser
+    src: Source
+    s: Scanner
+
+    private[toml] sets: Sets
+
+    nodes: Buf[Node]
+    known: Buf[Known]
+    counts: Buf[Count]
+    here: Buf[Step]
+    depth: usize
+
+/** How many elements an array of tables has so far, which is the reader's own count: nothing in the
+ * document says `[[fruit]]` is the third one.
+ */
+private[toml] struct Count
+    path: Buf[Step]
+    n: usize
+
+// The byte tables, built once per parse rather than once per program.
+//
+// **THEY ARE FIELDS ON THE PARSER RATHER THAN MODULE-LEVEL `val`s, WHICH IS NOT A STYLE CHOICE.** A
+// module-level binding is module storage, filled by an initializer before a program's statements run
+// -- and a `build-c` archive for a freestanding target has no entry point and no loader to run one,
+// so an `@export("main")` reaching one is refused outright. `sysl-lang/json` shipped a version that
+// could not be put on a board for exactly this, and so did `ogol`.
+private[toml] struct Sets
+    // Space and tab, which is all TOML calls whitespace: a newline ends a statement, so it is never
+    // skipped by accident.
+    blank: ByteSet
+
+    // What may start or continue a bare key. TOML's set is narrower than an identifier's -- no
+    // Unicode, and a `-` is ordinary.
+    bare: ByteSet
+
+    // The nine bytes that may follow a backslash in a basic string.
+    escapes: ByteSet
+
+private[toml] sets() -> Sets =
+    Sets(byte_set_of(" \t"),
+        byte_set_of("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-"),
+        byte_set_of("btnfr\"\\uU"))
+
+// Space and tab, and nothing else.
+private[toml] blanks(p: *Parser) -> usize = p.s.accept_while_set(p.sets.blank)
+
+// A comment runs to the end of the line and the newline is not part of it, because a newline is a
+// terminator the grammar above is waiting for.
+private[toml] comment(p: *Parser) -> Result[bool, Diagnostic]
+    if !p.s.accept(u8('#')) then return Ok(false)
+
+    // A comment may not carry a raw control character, which is the one rule that makes a
+    // truncated file with a stray NUL in it an error rather than something silently ignored.
+    loop
+        p.s.peek() match
+            None -> break
+            Some(c) ->
+                if c == u8('\n') then break
+
+                // A carriage return ends the line only as half of a CRLF. A lone one is a control
+                // character like any other, which is the rule that makes a file mangled in transit
+                // an error rather than something silently read as two documents' worth of lines.
+                if c == u8('\r') then
+                    if p.s.peek_at(1) == Some(u8('\n')) then break
+
+                    return Err(bare_cr(p))
+
+                if is_forbidden(c) then
+                    return Err(error(one(p.s.offset), "a comment may not hold a control character"))
+
+                p.s.bump()
+
+    Ok(true)
+end comment
+
+// Blanks, a comment if there is one, and then as many blank lines as follow.
+private[toml] skip_trivia(p: *Parser) -> Result[unit, Diagnostic]
+    loop
+        blanks(p)
+        comment(p)?
+
+        if !newline(p)? then break
+
+    Ok(())
+end skip_trivia
+
+// The statements, one per line.
+private document(p: *Parser) -> Result[unit, Diagnostic]
+    loop
+        skip_trivia(p)?
+
+        if p.s.at_end() then break
+
+        if p.s.peek() == Some(u8('[')) then
+            header(p)?
+        else
+            keyval(p)?
+
+        end_of_line(p)?
+
+    Ok(())
+end document
+
+// What has to follow a statement: blanks, an optional comment, and then a newline or the end of the
+// input. Anything else is a second statement on one line, which TOML does not have.
+private end_of_line(p: *Parser) -> Result[unit, Diagnostic]
+    blanks(p)
+    comment(p)?
+
+    if p.s.at_end() || newline(p)? then return Ok(())
+
+    val span = one(p.s.offset)
+
+    Err(expected(span, "a newline", found_at(p.src, span))
+        .with_note("TOML puts one key or one table header on a line"))
+end end_of_line
+
+// `[a.b]` and `[[a.b]]`, which differ by one byte and by everything they mean.
+private header(p: *Parser) -> Result[unit, Diagnostic]
+    val open = p.s.offset
+
+    p.s.bump()
+
+    val array = p.s.accept(u8('['))
+
+    blanks(p)
+
+    val parts = dotted_key(p)?
+
+    blanks(p)
+
+    if !p.s.accept(u8(']')) then
+        val span = one(p.s.offset)
+
+        return Err(expected(span, "`]`", found_at(p.src, span))
+            .with_label(if array then "this `[[` opened here" else "this `[` opened here"))
+
+    if array && !p.s.accept(u8(']')) then
+        val span = one(p.s.offset)
+
+        return Err(expected(span, "a second `]`", found_at(p.src, span))
+            .with_label("an array of tables opened here"))
+
+    if array then open_array_table(p, parts, open) else open_table(p, parts, open)
+end header
+
+// `[a.b.c]`: every step but the last comes into being implicitly, and the last is defined.
+private open_table(p: *Parser, parts: Buf[string], open: usize) -> Result[unit, Diagnostic]
+    var path: Buf[Step] = buf()
+
+    // Every step but the last is walked *into*; the last is what this header defines, so it must
+    // not be -- walking into it would take a `[[fruit]]` down to `fruit[0]` and define that twice.
+    for i in 0..<(parts.len() - 1)
+        path = walk_into(p, path, parts.at(i), open)?
+
+    path = extended(path, Key(parts.at(parts.len() - 1)))
+
+    claim_of(p, path) match
+        None -> ()
+        Some(c) -> c match
+            // A table the document only implied is exactly the one a header may now define.
+            Implicit -> ()
+            Header -> return Err(redefined(p, path, open, "a table defined by an earlier header"))
+            Leaf -> return Err(redefined(p, path, open, "a key with a value"))
+            Dotted -> return Err(redefined(p, path, open, "a table a dotted key already made"))
+            Inline -> return Err(redefined(p, path, open, "an inline table, which is closed once written"))
+            ArrayTables -> return Err(redefined(p, path, open, "an array of tables"))
+
+    set_claim(p, path, Header)
+    p.nodes.push(Node(path, None))
+    p.here = path
+    Ok(())
+end open_table
+
+// `[[a.b]]`: the last step names an array, and this header appends an element to it.
+private open_array_table(p: *Parser, parts: Buf[string], open: usize) -> Result[unit, Diagnostic]
+    var path: Buf[Step] = buf()
+
+    for i in 0..<(parts.len() - 1)
+        path = walk_into(p, path, parts.at(i), open)?
+
+    path = extended(path, Key(parts.at(parts.len() - 1)))
+
+    claim_of(p, path) match
+        None -> ()
+        Some(c) -> c match
+            ArrayTables -> ()
+            // **`Implicit` is refused here and allowed for a plain header**, which is the one place
+            // the two differ and it is not an oversight. `[[a.b]]` implies that `a` is a *table*;
+            // a later `[[a]]` would make it an array, and the specification's rule that a
+            // sub-table belongs to the most recently defined element above it then has no reading.
+            Implicit -> return Err(redefined(p, path, open, "a table an earlier header implied"))
+            Header -> return Err(redefined(p, path, open, "a table defined by a header"))
+            Leaf -> return Err(redefined(p, path, open, "a key with a value"))
+            Dotted -> return Err(redefined(p, path, open, "a table a dotted key already made"))
+            Inline -> return Err(redefined(p, path, open, "an inline table, which is closed once written"))
+
+    set_claim(p, path, ArrayTables)
+
+    val n = bump_count(p, path)
+    val element = extended(path, Index(n))
+
+    set_claim(p, element, Header)
+    p.nodes.push(Node(element, None))
+    p.here = element
+    Ok(())
+end open_array_table
+
+// One step of a header's path, before the last: it may pass through a table that already exists,
+// and it brings one into being where it does not.
+//
+// **An array of tables is walked into at its LAST element**, which is what makes `[fruit.variety]`
+// after two `[[fruit]]` headers mean the second fruit's variety. The specification states it as a
+// rule about the most recently defined table, and this is where that is spent.
+private walk_into(p: *Parser, path: Buf[Step], name: string, open: usize) -> Result[Buf[Step], Diagnostic]
+    val next = extended(path, Key(name))
+
+    claim_of(p, next) match
+        None ->
+            set_claim(p, next, Implicit)
+            Ok(next)
+        Some(c) -> c match
+            ArrayTables -> Ok(extended(next, Index(last_index(p, next))))
+            Header -> Ok(next)
+            Implicit -> Ok(next)
+            Dotted -> Ok(next)
+            Leaf -> Err(redefined(p, next, open, "a key with a value"))
+            Inline -> Err(redefined(p, next, open, "an inline table, which is closed once written"))
+end walk_into
+
+// `key = value`, `a.b.c = value`, written into whatever table is open.
+private keyval(p: *Parser) -> Result[unit, Diagnostic]
+    val at = p.s.offset
+    val parts = dotted_key(p)?
+
+    blanks(p)
+
+    if !p.s.accept(u8('=')) then
+        val span = one(p.s.offset)
+
+        return Err(expected(span, "`=`", found_at(p.src, span))
+            .with_note("a key is followed by `=` and a value on the same line"))
+
+    blanks(p)
+
+    val v = value(p)?
+
+    var path: Buf[Step] = p.here
+
+    // Every part but the last makes a table, and a dotted key may only make one it made itself:
+    // reaching through a header's table, or a table already written out, is what the specification
+    // refuses.
+    for i in 0..<(parts.len() - 1)
+        val next = extended(path, Key(parts.at(i)))
+
+        claim_of(p, next) match
+            None -> set_claim(p, next, Dotted)
+            Some(c) -> c match
+                Dotted -> ()
+                Leaf -> return Err(redefined(p, next, at, "a key with a value"))
+                Header -> return Err(redefined(p, next, at, "a table defined by a header"))
+                Implicit -> return Err(redefined(p, next, at, "a table an earlier header implied"))
+                Inline -> return Err(redefined(p, next, at, "an inline table, which is closed once written"))
+                ArrayTables -> return Err(redefined(p, next, at, "an array of tables"))
+
+        path = next
+
+    val leaf = extended(path, Key(parts.at(parts.len() - 1)))
+
+    claim_of(p, leaf) match
+        None -> ()
+        Some(_) -> return Err(redefined(p, leaf, at, "something already written"))
+
+    set_claim(p, leaf, Leaf)
+    freeze(p, leaf, v)
+    p.nodes.push(Node(leaf, Some(v)))
+    Ok(())
+end keyval
+
+// An inline table's interior is closed the moment it is written, so every path inside one is claimed
+// as `Inline` -- which is what turns a later `[a.b]` into a diagnostic rather than a silent merge.
+private freeze(p: *Parser, at: Buf[Step], v: Value)
+    v match
+        Table(es) ->
+            set_claim(p, at, Inline)
+
+            for i in 0..<es.len()
+                freeze(p, extended(at, Key(es.at(i).key)), es.at(i).value)
+        Arr(xs) ->
+            for i in 0..<xs.len()
+                freeze(p, extended(at, Index(i)), xs.at(i))
+        _ -> ()
+
+/** A dotted key: one or more simple keys separated by dots, with blanks allowed around each dot. */
+private[toml] dotted_key(p: *Parser) -> Result[Buf[string], Diagnostic]
+    var parts: Buf[string] = buf()
+
+    parts.push(simple_key(p)?)
+
+    loop
+        blanks(p)
+
+        if !p.s.accept(u8('.')) then break
+
+        blanks(p)
+        parts.push(simple_key(p)?)
+
+    Ok(parts)
+end dotted_key
+
+// A bare key, or a quoted one. A quoted key is read exactly as the string of the same shape is --
+// the specification says so outright -- so `"a\tb"` is a key with a tab in it.
+private simple_key(p: *Parser) -> Result[string, Diagnostic]
+    p.s.peek() match
+        None ->
+            val span = p.s.here()
+
+            Err(expected(span, "a key", "the end of the input"))
+        Some(c) ->
+            if c == u8('"') then
+                basic_string(p)
+            elif c == u8('\'') then
+                literal_string(p)
+            else
+                val m = p.s.mark()
+                val n = p.s.accept_while_set(p.sets.bare)
+
+                if n == 0 then
+                    val span = one(p.s.offset)
+
+                    return Err(expected(span, "a key", found_at(p.src, span))
+                        .with_note("a bare key is letters, digits, `_` and `-`; anything else is quoted"))
+
+                Ok(from_utf8_unchecked(p.s.text_from(m)))
+end simple_key
+
+// The registry, which is a sequence rather than a map for the reason the tree is: a document has
+// tens of tables, and a linear scan over tens is not something a configuration reader can measure.
+private[toml] claim_of(p: *Parser, path: Buf[Step]) -> Option[Claim]
+    for i in 0..<p.known.len()
+        if same_path(p.known.at(i).path, path) then return Some(p.known.at(i).claim)
+
+    None
+
+private[toml] set_claim(p: *Parser, path: Buf[Step], c: Claim)
+    for i in 0..<p.known.len()
+        if same_path(p.known.at(i).path, path) then
+            p.known.set(i, Known(path, c))
+            return
+
+    p.known.push(Known(path, c))
+
+// The next index for an array of tables, and the count moved on.
+private bump_count(p: *Parser, path: Buf[Step]) -> usize
+    for i in 0..<p.counts.len()
+        if same_path(p.counts.at(i).path, path) then
+            val n = p.counts.at(i).n
+
+            p.counts.set(i, Count(path, n + 1))
+            return n
+
+    p.counts.push(Count(path, 1))
+    0
+
+// The last element of an array of tables, which is the one a deeper header reaches into.
+private last_index(p: *Parser, path: Buf[Step]) -> usize
+    for i in 0..<p.counts.len()
+        if same_path(p.counts.at(i).path, path) then return p.counts.at(i).n - 1
+
+    0
+
+private redefined(p: *Parser, path: Buf[Step], at: usize, what: string) -> Diagnostic =
+    error(one(at), s"`${path_text(path)}` is already ${what}")
+        .with_note("TOML defines each table and each key once, so that a document has one reading")
+
+// A path written the way somebody would write it, for a message. It is not a re-parse of anything --
+// a key that needs quoting is quoted back.
+private[toml] path_text(path: Buf[Step]) -> string
+    var b = str_builder()
+
+    for i in 0..<path.len()
+        path.at(i) match
+            Key(name) ->
+                if i > 0 then b.push_char('.')
+
+                b.push(name)
+            Index(n) -> b.push(s"[$n]")
+
+    b.finish()
+
+/** A line ending, which is `\n` or `\r\n` and never a lone `\r`.
+ *
+ * **`accept_newline` takes the bare carriage return and TOML does not**, so this is the narrowing
+ * rather than a flag on the toolkit -- the same place every other narrowing in this package is made.
+ * An old Mac line ending is a real thing in other grammars and is not one here.
+ */
+private[toml] newline(p: *Parser) -> Result[bool, Diagnostic]
+    if p.s.accept(u8('\n')) then return Ok(true)
+
+    if p.s.peek() == Some(u8('\r')) then
+        if p.s.peek_at(1) != Some(u8('\n')) then return Err(bare_cr(p))
+
+        p.s.skip(2)
+        return Ok(true)
+
+    Ok(false)
+
+private[toml] bare_cr(p: *Parser) -> Diagnostic =
+    error(one(p.s.offset), "a carriage return ends a line only as part of `\\r\\n`")
+        .with_note("a lone `\\r` is a control character, and TOML has no place for one")
+
+private[toml] one(at: usize) -> Span = Span(at, at + 1)
+
+// A byte that may never appear raw in a TOML document: the C0 controls other than tab, and DEL.
+private[toml] is_forbidden(c: u8) -> bool = (c < 0x20u8 && c != 0x09u8) || c == 0x7fu8

@@ -1,0 +1,40 @@
+// TOML, read into a sysl value, for sysl.
+//
+// A document reads into a value that owns itself -- a table is a `Buf[Entry]` and an array a
+// `Buf[Value]`, with no reference anywhere -- so every walk over one is a plain `match`. That is
+// `sysl-lang/json`'s shape, deliberately: the two formats are read for the same reason and a
+// program that handles both should not have to learn two idioms.
+//
+// This is the block a consumer writes to reach it:
+//
+//     dependencies {
+//       toml { git = "github.com/sysl-lang/toml", version = "0.1.0" }
+//     }
+//
+// The coordinate names the package, `toml`; the module a program imports is `sh.sysl.toml`. Naming
+// the coordinate alone is enough to import `sh.sysl.parsing` too, since imports are transitive --
+// which a caller needs, because `parse` takes a `Source` and answers with a `Diagnostic`.
+
+package {
+  name    = "toml"
+  version = "0.1.0"
+
+  // The floor is the closure-in-a-`val` release, which is what every `Buf` walk in the reader is
+  // written against. Nothing here reaches for a construct newer than that.
+  sysl = "0.0.87"
+}
+
+dependencies {
+  parsing { git = "github.com/sysl-lang/parsing", version = "0.4.0" }
+}
+
+// **`heap = true`, for the reason json's manifest gives.** A document's size is not known until it
+// has been read: a table is a `Buf[Entry]`, an array a `Buf[Value]`, and a string with an escape in
+// it is gathered into a builder. Nothing here can be given caller-supplied storage, because nothing
+// here knows how much to ask for.
+//
+// **What is NOT here is `os` or `posix`.** This package neither opens nor reads anything: a `Source`
+// is made over text the caller already has. Where the document came from is the program's business.
+requires {
+  heap = true
+}

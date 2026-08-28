@@ -1,0 +1,773 @@
+module sh.sysl.toml
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.math.Float
+import sysl.text.{Ascii, char_from_u32, from_utf8_unchecked, parse_real, str_builder}
+import sysl.time.{LocalDate, LocalTime, LocalDateTime, Offset, date_at, days_in_month}
+
+// The value grammar: nine shapes, and the four of them that are dates.
+//
+// **The two readers this leans on hardest are `read_digits` and `char_from_u32`**, which are the two
+// places a hand-written TOML parser goes wrong. The first carries the underscore rule -- a separator
+// between digits and never at either end -- and the overflow test made *before* the arithmetic that
+// would wrap. The second refuses a surrogate, which `\uD800` in a basic string is and which a
+// parser that just shifts bits into a `char` will happily produce.
+
+/** A value, whatever kind. */
+private[toml] value(p: *Parser) -> Result[Value, Diagnostic]
+    p.s.peek() match
+        None ->
+            val span = p.s.here()
+
+            Err(expected(span, "a value", "the end of the input"))
+        Some(c) ->
+            if c == u8('"') then
+                if p.s.starts_with("\"\"\"".bytes) then multiline_basic(p) else Ok(Str(basic_string(p)?))
+            elif c == u8('\'') then
+                if p.s.starts_with("'''".bytes) then multiline_literal(p) else Ok(Str(literal_string(p)?))
+            elif c == u8('[') then
+                array(p)
+            elif c == u8('{') then
+                inline_table(p)
+            elif c == u8('t') then
+                word(p, "true", Bool(true))
+            elif c == u8('f') then
+                word(p, "false", Bool(false))
+            elif c == u8('i') || c == u8('n') then
+                special(p, 1)
+            elif c == u8('+') || c == u8('-') then
+                signed(p)
+            elif c.is_digit() then
+                if looks_like_date(p) || looks_like_time(p) then datetime(p) else number(p, 1)
+            else
+                val span = one(p.s.offset)
+
+                Err(expected(span, "a value", found_at(p.src, span))
+                    .with_note("a value is a string, a number, `true`, `false`, a date, an array or an inline table"))
+end value
+
+// A bare word, which has to be the whole word: `truely` is not `true` followed by anything.
+private word(p: *Parser, w: string, v: Value) -> Result[Value, Diagnostic]
+    val m = p.s.mark()
+
+    if p.s.accept_word(w.bytes, is_bare) then return Ok(v)
+
+    p.s.accept_while(is_bare)
+    Err(expected(p.s.span_from(m), s"`$w`", found_at(p.src, p.s.span_from(m))))
+
+// `inf` and `nan`, which are the two floats with no digits in them.
+private special(p: *Parser, sign: int) -> Result[Value, Diagnostic]
+    val m = p.s.mark()
+
+    if p.s.accept_word("inf".bytes, is_bare) then
+        return Ok(Float(if sign < 0 then -real.infinity() else real.infinity()))
+
+    if p.s.accept_word("nan".bytes, is_bare) then return Ok(Float(real.nan()))
+
+    p.s.accept_while(is_bare)
+    Err(expected(p.s.span_from(m), "a number", found_at(p.src, p.s.span_from(m))))
+end special
+
+// A sign, and then whatever a sign may go in front of -- which is a decimal number or `inf`/`nan`,
+// and never a radix prefix: `+0x1` is not a TOML integer.
+private signed(p: *Parser) -> Result[Value, Diagnostic]
+    val at = p.s.offset
+    val sign = if p.s.next() == Some(u8('-')) then -1 else 1
+
+    p.s.peek() match
+        None ->
+            val span = one(at)
+
+            Err(expected(span, "a number after the sign", "the end of the input"))
+        Some(c) ->
+            if c == u8('i') || c == u8('n') then
+                special(p, sign)
+            elif c.is_digit() then
+                radix_free(p, sign)
+            else
+                val span = one(p.s.offset)
+
+                Err(expected(span, "a number after the sign", found_at(p.src, span)))
+end signed
+
+// A number that had a sign written in front of it, which is a decimal and never a radix form:
+// `+0x1` is not a TOML integer, and neither is `-0b1`.
+//
+// **A `+` and no sign at all are the same value and not the same document**, which is why this is a
+// separate entry point rather than a test on the sign: `number` cannot tell `+1` from `1`.
+private radix_free(p: *Parser, sign: int) -> Result[Value, Diagnostic]
+    val at = p.s.offset
+
+    if p.s.peek() == Some(u8('0')) then
+        p.s.peek_at(1) match
+            Some(c) ->
+                if c == u8('x') || c == u8('o') || c == u8('b') then
+                    return Err(error(Span(at, at + 2),
+                        "a sign may not go in front of a hexadecimal, octal or binary integer"))
+            None -> ()
+
+    number(p, sign)
+
+// An integer or a float, with the cursor on the first digit.
+//
+// **The radix forms are integers and nothing else**, and their prefix is lowercase: TOML writes
+// `0x`, `0o` and `0b`, where `read_integer` would also take `0X`. So the prefix is read here and
+// only the digits go to the toolkit.
+private number(p: *Parser, sign: int) -> Result[Value, Diagnostic]
+    val start = p.s.offset
+
+    if p.s.peek() == Some(u8('0')) then
+        p.s.peek_at(1) match
+            Some(c) ->
+                val base = if c == u8('x') then 16 elif c == u8('o') then 8 elif c == u8('b') then 2 else 0
+
+                if base != 0 then
+                    p.s.skip(2)
+
+                    return read_digits(&p.s, base) match
+                        Err(e) -> Err(error(where(e), str(e)))
+                        Ok(v) -> Ok(Int(long(v)))
+
+                // A leading zero is a mistake in TOML rather than a radix: `01` is refused, and
+                // `0.5`, `0e2` and a bare `0` are not.
+                if c.is_digit() || c == u8('_') then
+                    return Err(error(one(start), "a number may not have a leading zero")
+                        .with_note("TOML writes `0` for zero, and an octal integer as `0o…`"))
+            None -> ()
+
+    val whole = read_digits(&p.s, 10) match
+        Err(e) -> return Err(error(where(e), str(e)))
+        Ok(v) -> v
+
+    var real_shaped = false
+
+    if p.s.peek() == Some(u8('.')) then
+        p.s.peek_at(1) match
+            Some(d) ->
+                if !d.is_digit() then
+                    return Err(error(one(p.s.offset + 1), "a fraction needs a digit after the point"))
+
+                real_shaped = true
+                p.s.bump()
+                read_digits(&p.s, 10) match
+                    Err(e) -> return Err(error(where(e), str(e)))
+                    Ok(_) -> ()
+            None -> return Err(error(one(p.s.offset), "a fraction needs a digit after the point"))
+
+    p.s.peek() match
+        Some(e) ->
+            if e == u8('e') || e == u8('E') then
+                real_shaped = true
+                p.s.bump()
+                p.s.accept(u8('+')) || p.s.accept(u8('-'))
+
+                read_digits(&p.s, 10) match
+                    Err(er) -> return Err(error(where(er), str(er)))
+                    Ok(_) -> ()
+        None -> ()
+
+    if !real_shaped then return Ok(Int(long(sign) * long(whole)))
+
+    val span = p.s.span_from(start)
+
+    stripped(p.s.src[span.start..<span.end]) match
+        Some(x) -> Ok(Float(if sign < 0 then -x else x))
+        None -> Err(error(span, "not a number this machine can hold"))
+end number
+
+// A float's text through the library's one converter, with the separators taken out.
+//
+// **A run with no `_` in it is not copied**, which is nearly every float anybody writes.
+private stripped(run: []const u8) -> Option[real]
+    var has = false
+
+    for i in 0..<run.len
+        if run[i] == u8('_') then has = true
+
+    if !has then
+        return parse_real(run) match
+            Ok(x) -> Some(x)
+            Err(_) -> None
+
+    var b: Buf[u8] = buf()
+
+    for i in 0..<run.len
+        if run[i] != u8('_') then b.push(run[i])
+
+    parse_real(b.view()) match
+        Ok(x) -> Some(x)
+        Err(_) -> None
+end stripped
+
+// Four digits and a `-` is a date; two digits and a `:` is a time. Nothing else in TOML's value
+// grammar starts that way, so one look settles which reader runs.
+private looks_like_date(p: *Parser) -> bool
+    for i in 0usize..<4
+        p.s.peek_at(i) match
+            Some(c) -> if !c.is_digit() then return false
+            None -> return false
+
+    p.s.peek_at(4) == Some(u8('-'))
+
+private looks_like_time(p: *Parser) -> bool =
+    p.s.peek_at(0).map((c) -> c.is_digit()) == Some(true) &&
+        p.s.peek_at(1).map((c) -> c.is_digit()) == Some(true) &&
+        p.s.peek_at(2) == Some(u8(':'))
+
+// The four date and time forms, which differ only in how much of the shape is there.
+private datetime(p: *Parser) -> Result[Value, Diagnostic]
+    if looks_like_time(p) then
+        val t = time_part(p)?
+
+        return Ok(Time(t))
+
+    val d = date_part(p)?
+
+    // A `T` joins a date to a time, and so does a space -- but only when a time really follows,
+    // since `d = 1979-05-27 # today` is a date and a comment.
+    var joined = false
+
+    if p.s.peek() == Some(u8('T')) || p.s.peek() == Some(u8('t')) then
+        p.s.bump()
+        joined = true
+    elif p.s.peek() == Some(u8(' ')) then
+        val m = p.s.mark()
+
+        p.s.bump()
+
+        if looks_like_time(p) then joined = true else p.s.reset(m)
+
+    if !joined then return Ok(Date(d))
+
+    val t = time_part(p)?
+    val dt = LocalDateTime(d, t)
+
+    p.s.peek() match
+        None -> Ok(DateTime(dt))
+        Some(c) ->
+            if c == u8('Z') || c == u8('z') then
+                p.s.bump()
+                Ok(OffsetDateTime(dt, Offset(0)))
+            elif c == u8('+') || c == u8('-') then
+                val neg = c == u8('-')
+
+                p.s.bump()
+
+                val h = fixed(p, 2)?
+
+                if !p.s.accept(u8(':')) then
+                    return Err(error(one(p.s.offset), "an offset is written `+HH:MM`"))
+
+                val mi = fixed(p, 2)?
+
+                if h > 23 then return Err(error(one(p.s.offset), "an offset hour is 00 to 23"))
+                if mi > 59 then return Err(error(one(p.s.offset), "an offset minute is 00 to 59"))
+
+                val total = h * 60 + mi
+
+                Ok(OffsetDateTime(dt, Offset(if neg then -total else total)))
+            else
+                Ok(DateTime(dt))
+end datetime
+
+private date_part(p: *Parser) -> Result[LocalDate, Diagnostic]
+    val at = p.s.offset
+    val y = fixed(p, 4)?
+
+    if !p.s.accept(u8('-')) then return Err(error(one(p.s.offset), "a date is written `YYYY-MM-DD`"))
+
+    val m = fixed(p, 2)?
+
+    if !p.s.accept(u8('-')) then return Err(error(one(p.s.offset), "a date is written `YYYY-MM-DD`"))
+
+    val d = fixed(p, 2)?
+
+    if m < 1 || m > 12 then return Err(error(Span(at, p.s.offset), "a month is 01 to 12"))
+    if d < 1 || d > days_in_month(y, m) then
+        return Err(error(Span(at, p.s.offset), s"$y-$m has no day $d"))
+
+    Ok(date_at(y, m, d))
+end date_part
+
+private time_part(p: *Parser) -> Result[LocalTime, Diagnostic]
+    val at = p.s.offset
+    val h = fixed(p, 2)?
+
+    if !p.s.accept(u8(':')) then return Err(error(one(p.s.offset), "a time is written `HH:MM:SS`"))
+
+    val mi = fixed(p, 2)?
+
+    if !p.s.accept(u8(':')) then return Err(error(one(p.s.offset), "a time is written `HH:MM:SS`"))
+
+    val sec = fixed(p, 2)?
+
+    // A fraction is any number of digits and this representation holds six, so the rest is
+    // dropped -- which is what the specification asks an implementation to do rather than refuse.
+    var us: long = 0
+
+    if p.s.peek() == Some(u8('.')) then
+        p.s.peek_at(1) match
+            Some(d) ->
+                if !d.is_digit() then
+                    return Err(error(one(p.s.offset + 1), "a fraction needs a digit after the point"))
+
+                p.s.bump()
+
+                var place: long = 100000
+
+                loop
+                    p.s.peek() match
+                        Some(c) ->
+                            if !c.is_digit() then break
+
+                            if place > 0 then
+                                us += long(int(c) - int(u8('0'))) * place
+                                place = place / 10
+
+                            p.s.bump()
+                        None -> break
+            None -> return Err(error(one(p.s.offset), "a fraction needs a digit after the point"))
+
+    if h > 23 then return Err(error(Span(at, p.s.offset), "an hour is 00 to 23"))
+    if mi > 59 then return Err(error(Span(at, p.s.offset), "a minute is 00 to 59"))
+
+    // Sixty is a leap second, which RFC 3339 has and a clock does not: it is read rather than
+    // refused, and lands on the last microsecond of the minute the way every other library does.
+    if sec > 60 then return Err(error(Span(at, p.s.offset), "a second is 00 to 60"))
+
+    val whole = long(h) * 3600000000 + long(mi) * 60000000 + long(if sec == 60 then 59 else sec) * 1000000
+
+    Ok(LocalTime(whole + us))
+end time_part
+
+// Exactly `n` digits, which is what every field of a date is. A short run is the document's mistake
+// and not a shorter number.
+private fixed(p: *Parser, n: int) -> Result[int, Diagnostic]
+    var v = 0
+
+    for _ in 0..<n
+        p.s.next() match
+            None -> return Err(error(one(p.s.offset), s"a date or time wants $n digits here"))
+            Some(c) ->
+                if !c.is_digit() then
+                    return Err(error(one(p.s.offset - 1), s"a date or time wants $n digits here"))
+
+                v = v * 10 + (int(c) - int(u8('0')))
+
+    Ok(v)
+end fixed
+
+/** A basic string, with the cursor on its opening quote. Also how a quoted key is read: the
+ * specification says a quoted key is exactly the string of the same shape.
+ */
+private[toml] basic_string(p: *Parser) -> Result[string, Diagnostic]
+    val open = p.s.offset
+
+    p.s.bump()
+
+    var b = str_builder()
+
+    loop
+        p.s.peek() match
+            None -> return Err(unterminated(p, open, "a basic string"))
+            Some(c) ->
+                if c == u8('"') then
+                    p.s.bump()
+                    break
+                elif c == u8('\n') || c == u8('\r') then
+                    return Err(error(one(p.s.offset), "a basic string may not run past the end of the line")
+                        .with_note("a string that spans lines is written between `\"\"\"`"))
+                elif c == u8('\\') then
+                    b.push_char(escape(p)?)
+                elif is_forbidden(c) then
+                    return Err(control(p))
+                else
+                    p.s.next_char() match
+                        Some(ch) -> b.push_char(ch)
+                        None -> return Err(unterminated(p, open, "a basic string"))
+
+    Ok(b.finish())
+end basic_string
+
+/** A literal string: no escapes at all, so a Windows path is written as itself. */
+private[toml] literal_string(p: *Parser) -> Result[string, Diagnostic]
+    val open = p.s.offset
+
+    p.s.bump()
+
+    val m = p.s.mark()
+
+    loop
+        p.s.peek() match
+            None -> return Err(unterminated(p, open, "a literal string"))
+            Some(c) ->
+                if c == u8('\'') then break
+                if c == u8('\n') || c == u8('\r') then
+                    return Err(error(one(p.s.offset), "a literal string may not run past the end of the line")
+                        .with_note("a literal string that spans lines is written between `'''`"))
+                if is_forbidden(c) then return Err(control(p))
+
+                p.s.bump()
+
+    val text = from_utf8_unchecked(p.s.text_from(m))
+
+    p.s.bump()
+    Ok(text)
+end literal_string
+
+// The nine escapes TOML has, which is a narrower set than `read_escape` knows -- so the byte after
+// the backslash is checked here before the shared reader is trusted with it.
+//
+// **`\U` is read here rather than there**, because the toolkit's escape reader has no eight-digit
+// form: it knows `\uHHHH` and `\u{…}`, and TOML has `\uHHHH` and `\UHHHHHHHH`.
+private escape(p: *Parser) -> Result[char, Diagnostic]
+    val at = p.s.offset
+
+    p.s.peek_at(1) match
+        None -> Err(unterminated(p, at, "an escape"))
+        Some(c) ->
+            if !p.sets.escapes.has(c) then
+                Err(error(Span(at, at + 2), s"`\\${from_utf8_unchecked([c])}` is not an escape")
+                    .with_note("TOML has \\b \\t \\n \\f \\r \\\" \\\\ \\uXXXX and \\UXXXXXXXX"))
+            elif c == u8('U') then
+                p.s.skip(2)
+                hex_escape(p, 8, at)
+            elif c == u8('u') then
+                p.s.skip(2)
+                hex_escape(p, 4, at)
+            else
+                read_escape(&p.s) match
+                    Ok(ch) -> Ok(ch)
+                    Err(e) -> Err(error(where(e), str(e)))
+end escape
+
+// Exactly `n` hexadecimal digits, and the codepoint they name.
+//
+// **A surrogate is refused rather than encoded**, which is what `char_from_u32` answers `None` for:
+// `\uD800` names half a character and there is nothing to put in the string.
+private hex_escape(p: *Parser, n: int, at: usize) -> Result[char, Diagnostic]
+    var v: u32 = 0
+
+    for _ in 0..<n
+        p.s.next() match
+            None -> return Err(unterminated(p, at, "an escape"))
+            Some(c) ->
+                c.digit_value(16) match
+                    Some(d) -> v = v * 16u32 + u32(d)
+                    None -> return Err(error(one(p.s.offset - 1), s"an escape wants $n hexadecimal digits"))
+
+    char_from_u32(v) match
+        Some(ch) -> Ok(ch)
+        None -> Err(error(Span(at, p.s.offset), "that is not a character")
+            .with_note("a surrogate and anything past U+10FFFF are not codepoints a string can hold"))
+end hex_escape
+
+/** A multi-line basic string, between `"""`. */
+private multiline_basic(p: *Parser) -> Result[Value, Diagnostic]
+    val open = p.s.offset
+
+    p.s.skip(3)
+    open_newline(p)
+
+    var b = str_builder()
+
+    loop
+        if p.s.peek() == Some(u8('"')) then
+            quote_run(p, u8('"')) match
+                Text(n) ->
+                    for _ in 0..<n do b.push_char('"')
+
+                    p.s.skip(n)
+                Ends(keep) ->
+                    for _ in 0..<keep do b.push_char('"')
+
+                    p.s.skip(keep + 3)
+                    break
+                TooMany -> return Err(too_many_quotes(p, u8('"')))
+
+            continue
+
+        p.s.peek() match
+            None -> return Err(unterminated(p, open, "a multi-line basic string"))
+            Some(c) ->
+                if c == u8('\\') then
+                    // A backslash at the end of a line eats the line break and every blank after
+                    // it, which is how a long value is written down a page without the spaces
+                    // getting into it.
+                    if trims_line(p) then
+                        p.s.bump()
+                        p.s.accept_while((x) -> x == u8(' ') || x == u8('\t') || x == u8('\n') || x == u8('\r'))
+                    else
+                        b.push_char(escape(p)?)
+                elif is_forbidden_here(c) then
+                    return Err(control(p))
+                else
+                    p.s.next_char() match
+                        Some(ch) -> b.push_char(ch)
+                        None -> return Err(unterminated(p, open, "a multi-line basic string"))
+
+    Ok(Str(b.finish()))
+end multiline_basic
+
+/** A multi-line literal string, between `'''`: no escapes, and the line breaks are what was
+ * written.
+ */
+private multiline_literal(p: *Parser) -> Result[Value, Diagnostic]
+    val open = p.s.offset
+
+    p.s.skip(3)
+    open_newline(p)
+
+    var b = str_builder()
+
+    loop
+        if p.s.peek() == Some(u8('\'')) then
+            quote_run(p, u8('\'')) match
+                Text(n) ->
+                    for _ in 0..<n do b.push_char('\'')
+
+                    p.s.skip(n)
+                Ends(keep) ->
+                    for _ in 0..<keep do b.push_char('\'')
+
+                    p.s.skip(keep + 3)
+                    break
+                TooMany -> return Err(too_many_quotes(p, u8('\'')))
+
+            continue
+
+        p.s.peek() match
+            None -> return Err(unterminated(p, open, "a multi-line literal string"))
+            Some(c) ->
+                if is_forbidden_here(c) then return Err(control(p))
+
+                p.s.next_char() match
+                    Some(ch) -> b.push_char(ch)
+                    None -> return Err(unterminated(p, open, "a multi-line literal string"))
+
+    Ok(Str(b.finish()))
+end multiline_literal
+
+// A newline straight after the opening delimiter is not part of the string, which is what lets the
+// value start on the line below the key.
+private open_newline(p: *Parser)
+    if p.s.peek() == Some(u8('\r')) && p.s.peek_at(1) == Some(u8('\n')) then
+        p.s.skip(2)
+    elif p.s.peek() == Some(u8('\n')) then
+        p.s.bump()
+
+// What a run of the quote character means, with the cursor on the first of them.
+//
+// **Up to two of it may sit against the closing delimiter and belong to the string**, which is how a
+// multi-line string ends with a quote: `"""he said """"` is `he said "`. So the run is counted, the
+// last three close it, and the ones before them are text. A run of six is two delimiters with
+// nothing between and is as far as the grammar goes.
+private enum Quotes
+    // Fewer than three: ordinary text, this many of them.
+    Text(n: usize)
+
+    // The string ends here, with `keep` of the quotes belonging to it.
+    Ends(keep: usize)
+
+    TooMany
+end Quotes
+
+private quote_run(p: *Parser, q: u8) -> Quotes
+    var run: usize = 0
+
+    loop
+        if p.s.peek_at(run) == Some(q) then run += 1 else break
+
+    if run < 3 then
+        Text(run)
+    elif run > 5 then
+        TooMany
+    else
+        Ends(run - 3)
+
+// Whether this backslash is the line-trimming one: everything after it to the end of the line is
+// blank.
+private trims_line(p: *Parser) -> bool
+    var i: usize = 1
+
+    loop
+        p.s.peek_at(i) match
+            None -> return false
+            Some(c) ->
+                if c == u8('\n') then return true
+                if c == u8('\r') && p.s.peek_at(i + 1) == Some(u8('\n')) then return true
+                if c != u8(' ') && c != u8('\t') then return false
+
+                i += 1
+
+/** An array. Newlines and comments are allowed inside one, and so is a comma after the last
+ * element.
+ */
+private array(p: *Parser) -> Result[Value, Diagnostic]
+    val open = p.s.offset
+
+    if p.depth >= max_depth then
+        return Err(error(one(open), s"more than $max_depth levels of nesting"))
+
+    p.s.bump()
+    p.depth += 1
+
+    var items: Buf[Value] = buf()
+
+    loop
+        skip_trivia(p)?
+
+        if p.s.at_end() then return Err(unterminated(p, open, "an array"))
+        if p.s.accept(u8(']')) then break
+
+        items.push(value(p)?)
+        skip_trivia(p)?
+
+        if p.s.accept(u8(',')) then continue
+        if p.s.accept(u8(']')) then break
+
+        val span = one(p.s.offset)
+
+        return Err(expected(span, "`,` or `]`", found_at(p.src, span))
+            .with_label("this array opened here"))
+
+    p.depth -= 1
+    Ok(Arr(items))
+end array
+
+/** An inline table, which is written on one line and is closed the moment it is: nothing may be
+ * added to it later, and `tree.sysl`'s `Inline` claim is what remembers that.
+ */
+private inline_table(p: *Parser) -> Result[Value, Diagnostic]
+    val open = p.s.offset
+
+    if p.depth >= max_depth then
+        return Err(error(one(open), s"more than $max_depth levels of nesting"))
+
+    p.s.bump()
+    p.depth += 1
+
+    var slots: Buf[Slot] = buf()
+
+    blanks(p)
+
+    if p.s.accept(u8('}')) then
+        p.depth -= 1
+        return Ok(Table(buf()))
+
+    loop
+        blanks(p)
+
+        val parts = dotted_key(p)?
+
+        blanks(p)
+
+        if !p.s.accept(u8('=')) then
+            val span = one(p.s.offset)
+
+            return Err(expected(span, "`=`", found_at(p.src, span)))
+
+        blanks(p)
+
+        val v = value(p)?
+
+        slots = put(p, slots, parts, 0, v, open)?
+
+        blanks(p)
+
+        if p.s.accept(u8(',')) then continue
+        if p.s.accept(u8('}')) then break
+
+        val span = one(p.s.offset)
+
+        return Err(expected(span, "`,` or `}`", found_at(p.src, span))
+            .with_label("this inline table opened here")
+            .with_note("an inline table is written on one line, and has no comma after its last entry"))
+
+    p.depth -= 1
+    Ok(Table(harvest(slots)))
+end inline_table
+
+// A dotted key inside an inline table, which nests as it goes: `{ a.b = 1, a.c = 2 }` is one table
+// `a` with two entries. Built here rather than through the document's registry, because an inline
+// table is finished before anything outside it can see it.
+//
+// **A slot remembers HOW it came to be, which a finished `Entry` cannot.** `{ a = { b = 1 }, a.c = 2 }`
+// is refused and `{ a.b = 1, a.c = 2 }` is not, and the two produce the same tree -- so what
+// separates them is not the shape but the history: a table *written* as a value is closed the
+// instant its brace does, and one a dotted key made is still open to another dotted key. An
+// implementation that walks the tree it has built so far cannot tell those apart, which is how a
+// parser passes the ordinary cases and accepts `overwrite-08`.
+private struct Slot
+    key: string
+
+    // `Some` for a value somebody wrote, `None` for a table a dotted key brought into being. The
+    // two are exclusive: `inner` is empty for the first and is the answer for the second.
+    written: Option[Value]
+    inner: Buf[Slot]
+
+private put(p: *Parser, slots: Buf[Slot], parts: Buf[string], i: usize, v: Value, open: usize) -> Result[Buf[Slot], Diagnostic]
+    val name = parts.at(i)
+    val last = i == parts.len() - 1
+
+    var out: Buf[Slot] = buf()
+    var placed = false
+
+    for k in 0..<slots.len()
+        val slot = slots.at(k)
+
+        if slot.key != name then
+            out.push(slot)
+        elif last then
+            return Err(error(one(open), s"`$name` is written twice in this inline table"))
+        else
+            slot.written match
+                Some(_) -> return Err(error(one(open),
+                    s"`$name` is already a value in this inline table, so a dotted key may not add to it")
+                    .with_note("a table written as `{ … }` is closed the moment its brace is"))
+                None ->
+                    placed = true
+                    out.push(Slot(name, None, put(p, slot.inner, parts, i + 1, v, open)?))
+
+    if !placed then
+        if last then
+            out.push(Slot(name, Some(v), buf()))
+        else
+            var empty: Buf[Slot] = buf()
+
+            out.push(Slot(name, None, put(p, empty, parts, i + 1, v, open)?))
+
+    Ok(out)
+end put
+
+// The slots as the entries a caller sees, the history dropped now that nothing can be added.
+private harvest(slots: Buf[Slot]) -> Buf[Entry]
+    var out: Buf[Entry] = buf()
+
+    for i in 0..<slots.len()
+        val slot = slots.at(i)
+
+        slot.written match
+            Some(v) -> out.push(Entry(slot.key, v))
+            None -> out.push(Entry(slot.key, Table(harvest(slot.inner))))
+
+    out
+
+private too_many_quotes(p: *Parser, q: u8) -> Diagnostic =
+    error(one(p.s.offset), "six of the quote character in a row ends the string and opens nothing")
+        .with_note("at most two may sit against the closing delimiter and belong to the string")
+
+private unterminated(p: *Parser, open: usize, what: string) -> Diagnostic =
+    error(p.s.here(), s"$what was never closed").with_label("it opened here")
+
+private control(p: *Parser) -> Diagnostic =
+    error(one(p.s.offset), "a control character may not be written into a string as itself")
+        .with_note("write it as an escape: a tab is `\\t`, and anything else is `\\u00XX`")
+
+// The controls a multi-line string may hold, which is the single-line rule with the line break
+// allowed: the whole point of the form is that the break is part of the text.
+private is_forbidden_here(c: u8) -> bool = is_forbidden(c) && c != 0x0au8 && c != 0x0du8
+
+private[toml] is_bare(c: u8) -> bool =
+    c.is_alnum() || c == u8('_') || c == u8('-')

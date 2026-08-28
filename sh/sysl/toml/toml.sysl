@@ -1,0 +1,175 @@
+module sh.sysl.toml
+
+import sysl.buf.{Buf, buf}
+import sysl.time.{LocalDate, LocalTime, LocalDateTime, Offset}
+
+// The value, and the two things a caller does with one that a `match` does not do well: ask what it
+// is, and reach into it by name or by position.
+//
+// **The tree owns itself.** A table holds `Buf[Entry]` and an array holds `Buf[Value]` -- no `&`
+// anywhere. A `Buf[T]` stores its elements in a slice it allocates, so the recursion goes through a
+// pointer the buffer holds rather than through one the type declares, and `Value` has a finite size
+// all the same. Every walk over a document is therefore `v match` on an ordinary value.
+//
+// **A document read here keeps the order it was written in.** Entries are a sequence rather than a
+// map, so a table renders back the way it arrived and `get` is a linear scan. That is the right
+// trade for the sizes TOML is used at -- it is a configuration format, and a file with a thousand
+// keys in one table is not a thing anybody writes.
+
+/** One entry of a table: the key it was written under, and what was written there.
+ *
+ * A named struct rather than a pair, because it is a public payload: a caller walking a table reads
+ * `e.key` and `e.value`, which a tuple's positions cannot say.
+ */
+struct Entry
+    key: string
+    value: Value
+
+/** A TOML value: one of the nine things the grammar can produce.
+ *
+ * **The four date and time forms are four variants and not one**, because TOML makes them four
+ * types and a reader that collapsed them would be answering a question the document did not ask. An
+ * offset date-time knows where on the planet it was written; a local date-time does not, and is not
+ * a point on the timeline until somebody supplies a zone. `sysl.time` already draws exactly this
+ * line, so the variants carry its types rather than inventing any.
+ *
+ * **`OffsetDateTime` keeps the offset it was written with rather than folding to an `Instant`.**
+ * `sysl.time.parse_timestamp` answers an `Instant`, which is the right answer for a log line and
+ * the wrong one here: `1979-05-27T00:32:00-07:00` and `1979-05-27T07:32:00Z` are the same instant
+ * and are not the same document, and a format that is read to be written back has to say which was
+ * written. `to_instant` is one call away for a caller who wants the other question answered.
+ *
+ * **Integers are `long` and floats are `real`, which is what TOML says.** The specification requires
+ * a signed 64-bit integer range and IEEE 754 binary64, so there is no choice to make here and none
+ * of json's `Int`/`Real` ambiguity: `1` is an integer and `1.0` is a float, and the document said
+ * which.
+ */
+enum Value
+    Str(s: string)
+    Int(n: long)
+    Float(x: real)
+    Bool(b: bool)
+    OffsetDateTime(dt: LocalDateTime, offset: Offset)
+    DateTime(dt: LocalDateTime)
+    Date(d: LocalDate)
+    Time(t: LocalTime)
+    Arr(items: Buf[Value])
+    Table(entries: Buf[Entry])
+
+    is_str(self) -> bool = self.as_str().is_some()
+
+    is_int(self) -> bool = self match
+        Int(_) -> true
+        _ -> false
+
+    is_float(self) -> bool = self match
+        Float(_) -> true
+        _ -> false
+
+    is_bool(self) -> bool = self.as_bool().is_some()
+
+    is_array(self) -> bool = self match
+        Arr(_) -> true
+        _ -> false
+
+    is_table(self) -> bool = self match
+        Table(_) -> true
+        _ -> false
+
+    /** Whether this is any of the four date and time forms, for a caller that only wants to know
+     * whether it has to think about time at all.
+     */
+    is_datetime(self) -> bool = self match
+        OffsetDateTime(_, _) -> true
+        DateTime(_) -> true
+        Date(_) -> true
+        Time(_) -> true
+        _ -> false
+
+    /** The string this is, or `None` for every other shape.
+     *
+     * The `as_*` family never converts and never coerces: a string reading `"true"` is a string, and
+     * `Str("1").as_int()` is `None`. What a document meant is the document's business, so a caller
+     * who wants a number out of a string says so by reaching for `sysl.text`'s parsers.
+     */
+    as_str(self) -> Option[string] = self match
+        Str(s) -> Some(s)
+        _ -> None
+
+    as_int(self) -> Option[long] = self match
+        Int(n) -> Some(n)
+        _ -> None
+
+    as_bool(self) -> Option[bool] = self match
+        Bool(b) -> Some(b)
+        _ -> None
+
+    /** The float this is, **and an integer widened to one**, which is the one place the family bends
+     * and it bends the way every caller wants. A field documented as a float is written `1.0` by one
+     * person and `1` by the next, and refusing the second means every consumer writes this match
+     * itself. Nothing is lost that a `long` past 2^53 would not lose anyway, and `as_int` is still
+     * there for a caller who needs to know which was written.
+     */
+    as_float(self) -> Option[real] = self match
+        Float(x) -> Some(x)
+        Int(n) -> Some(real(n))
+        _ -> None
+
+    /** The entries of a table, or `None` for every other shape. */
+    as_table(self) -> Option[Buf[Entry]] = self match
+        Table(es) -> Some(es)
+        _ -> None
+
+    /** The elements of an array, or `None` for every other shape. */
+    as_array(self) -> Option[Buf[Value]] = self match
+        Arr(xs) -> Some(xs)
+        _ -> None
+
+    /** How many entries a table has, or how many elements an array has. Every other shape is one
+     * thing and answers `1`, which is what makes this safe to call on anything.
+     */
+    len(self) -> usize = self match
+        Table(es) -> es.len()
+        Arr(xs) -> xs.len()
+        _ -> 1
+
+    /** What was written under `key`, or `None` where this is not a table or has no such key.
+     *
+     * The key is the **decoded** one, so a table written `"a.b" = 1` is reached by `get("a.b")` and
+     * not by anything involving dots: a dotted key in the source is a path, and a quoted one is a
+     * name that happens to contain a dot. By the time a document is a `Value` the distinction has
+     * been made and what is left is the name.
+     */
+    get(self, key: string) -> Option[Value] = self match
+        Table(es) ->
+            var found: Option[Value] = None
+
+            for i in 0..<es.len()
+                if es.at(i).key == key then
+                    found = Some(es.at(i).value)
+                    break
+
+            found
+        _ -> None
+
+    /** The element at `i`, or `None` where this is not an array or is not that long. */
+    at(self, i: usize) -> Option[Value] = self match
+        Arr(xs) -> if i < xs.len() then Some(xs.at(i)) else None
+        _ -> None
+
+    /** Whether a table has this key at all, which `get` cannot be asked without building an
+     * `Option` around a value that may be large.
+     */
+    has(self, key: string) -> bool = self.get(key).is_some()
+end Value
+
+/** The point on the timeline an offset date-time names.
+ *
+ * A free function rather than a method on the variant, because it is a *conversion* and the value is
+ * what the document said. It is `None` for the other three forms and that is the whole reason to
+ * reach for it: a local date-time names no instant until somebody supplies a zone, and this refuses
+ * to guess one rather than quietly assuming UTC.
+ */
+to_instant(v: Value) -> Option[sysl.time.Instant] = v match
+    OffsetDateTime(dt, o) -> Some(sysl.time.from_offset(dt, o))
+    _ -> None
