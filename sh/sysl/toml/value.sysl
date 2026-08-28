@@ -671,7 +671,8 @@ private struct Slot
     written: Option[Value]
     inner: Buf[Slot]
 
-private put(p: *Parser, slots: Buf[Slot], parts: Buf[string], i: usize, v: Value, open: usize) -> Result[Buf[Slot], Diagnostic]
+private put(p: *Parser, slots: Buf[Slot], parts: Buf[string], i: usize,
+            v: Value, open: usize) -> Result[Buf[Slot], Diagnostic]
     val name = parts.at(i)
     val last = i == parts.len() - 1
 
