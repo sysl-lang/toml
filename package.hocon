@@ -25,7 +25,7 @@ package {
 }
 
 dependencies {
-  parsing { git = "github.com/sysl-lang/parsing", version = "0.4.0" }
+  parsing { git = "github.com/sysl-lang/parsing", version = "0.5.0" }
 }
 
 // **`heap = true`, for the reason json's manifest gives.** A document's size is not known until it

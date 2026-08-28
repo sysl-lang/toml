@@ -390,29 +390,33 @@ private[toml] basic_string(p: *Parser) -> Result[string, Diagnostic]
     Ok(b.finish())
 end basic_string
 
-/** A literal string: no escapes at all, so a Windows path is written as itself. */
+/** A literal string: no escapes at all, so a Windows path is written as itself.
+ *
+ * **The toolkit reads it and this checks it**, which is exactly the split the package keeps
+ * everywhere else. `read_raw` knows the shape -- text up to the closing quote, and the input running
+ * out is the one thing it refuses -- and TOML's two narrowings are its own: no line break, and no
+ * raw control character. They are made over what came back rather than byte by byte, which is exact
+ * because a literal string decodes nothing: the nth byte of the text is the nth byte of the input.
+ */
 private[toml] literal_string(p: *Parser) -> Result[string, Diagnostic]
     val open = p.s.offset
+    val from = open + 1
 
-    p.s.bump()
+    val text = read_raw(&p.s, u8('\'')) match
+        Ok(t) -> t
+        Err(_) -> return Err(unterminated(p, open, "a literal string"))
 
-    val m = p.s.mark()
+    val bytes = text.bytes
 
-    loop
-        p.s.peek() match
-            None -> return Err(unterminated(p, open, "a literal string"))
-            Some(c) ->
-                if c == u8('\'') then break
-                if c == u8('\n') || c == u8('\r') then
-                    return Err(error(one(p.s.offset), "a literal string may not run past the end of the line")
-                        .with_note("a literal string that spans lines is written between `'''`"))
-                if is_forbidden(c) then return Err(control(p))
+    for i in 0..<bytes.len
+        val c = bytes[i]
 
-                p.s.bump()
+        if c == u8('\n') || c == u8('\r') then
+            return Err(error(one(from + i), "a literal string may not run past the end of the line")
+                .with_note("a literal string that spans lines is written between `\'\'\'`"))
 
-    val text = from_utf8_unchecked(p.s.text_from(m))
+        if is_forbidden(c) then return Err(control_at(from + i))
 
-    p.s.bump()
     Ok(text)
 end literal_string
 
@@ -432,36 +436,25 @@ private escape(p: *Parser) -> Result[char, Diagnostic]
                     .with_note("TOML has \\b \\t \\n \\f \\r \\\" \\\\ \\uXXXX and \\UXXXXXXXX"))
             elif c == u8('U') then
                 p.s.skip(2)
-                hex_escape(p, 8, at)
+                fixed_escape(p, 8, at)
             elif c == u8('u') then
                 p.s.skip(2)
-                hex_escape(p, 4, at)
+                fixed_escape(p, 4, at)
             else
                 read_escape(&p.s) match
                     Ok(ch) -> Ok(ch)
                     Err(e) -> Err(error(where(e), str(e)))
 end escape
 
-// Exactly `n` hexadecimal digits, and the codepoint they name.
+// The toolkit's own fixed-width escape reader, with its refusal reworded for a TOML reader.
 //
-// **A surrogate is refused rather than encoded**, which is what `char_from_u32` answers `None` for:
-// `\uD800` names half a character and there is nothing to put in the string.
-private hex_escape(p: *Parser, n: int, at: usize) -> Result[char, Diagnostic]
-    var v: u32 = 0
-
-    for _ in 0..<n
-        p.s.next() match
-            None -> return Err(unterminated(p, at, "an escape"))
-            Some(c) ->
-                c.digit_value(16) match
-                    Some(d) -> v = v * 16u32 + u32(d)
-                    None -> return Err(error(one(p.s.offset - 1), s"an escape wants $n hexadecimal digits"))
-
-    char_from_u32(v) match
-        Some(ch) -> Ok(ch)
-        None -> Err(error(Span(at, p.s.offset), "that is not a character")
-            .with_note("a surrogate and anything past U+10FFFF are not codepoints a string can hold"))
-end hex_escape
+// **A surrogate is refused rather than encoded**, which is the line a hand-written version leaves
+// out: `\uD800` names half a character and there is nothing to put in the string.
+private fixed_escape(p: *Parser, n: int, at: usize) -> Result[char, Diagnostic]
+    read_hex_escape(&p.s, n, at) match
+        Ok(ch) -> Ok(ch)
+        Err(e) -> Err(error(where(e), str(e))
+            .with_note(s"an escape wants $n hexadecimal digits, and a surrogate is not a character"))
 
 /** A multi-line basic string, between `"""`. */
 private multiline_basic(p: *Parser) -> Result[Value, Diagnostic]
@@ -474,7 +467,7 @@ private multiline_basic(p: *Parser) -> Result[Value, Diagnostic]
 
     loop
         if p.s.peek() == Some(u8('"')) then
-            quote_run(p, u8('"')) match
+            fence_run(&p.s, u8('"')) match
                 Text(n) ->
                     for _ in 0..<n do b.push_char('"')
 
@@ -523,7 +516,7 @@ private multiline_literal(p: *Parser) -> Result[Value, Diagnostic]
 
     loop
         if p.s.peek() == Some(u8('\'')) then
-            quote_run(p, u8('\'')) match
+            fence_run(&p.s, u8('\'')) match
                 Text(n) ->
                     for _ in 0..<n do b.push_char('\'')
 
@@ -556,35 +549,6 @@ private open_newline(p: *Parser)
         p.s.skip(2)
     elif p.s.peek() == Some(u8('\n')) then
         p.s.bump()
-
-// What a run of the quote character means, with the cursor on the first of them.
-//
-// **Up to two of it may sit against the closing delimiter and belong to the string**, which is how a
-// multi-line string ends with a quote: `"""he said """"` is `he said "`. So the run is counted, the
-// last three close it, and the ones before them are text. A run of six is two delimiters with
-// nothing between and is as far as the grammar goes.
-private enum Quotes
-    // Fewer than three: ordinary text, this many of them.
-    Text(n: usize)
-
-    // The string ends here, with `keep` of the quotes belonging to it.
-    Ends(keep: usize)
-
-    TooMany
-end Quotes
-
-private quote_run(p: *Parser, q: u8) -> Quotes
-    var run: usize = 0
-
-    loop
-        if p.s.peek_at(run) == Some(q) then run += 1 else break
-
-    if run < 3 then
-        Text(run)
-    elif run > 5 then
-        TooMany
-    else
-        Ends(run - 3)
 
 // Whether this backslash is the line-trimming one: everything after it to the end of the line is
 // blank.
@@ -761,8 +725,10 @@ private too_many_quotes(p: *Parser, q: u8) -> Diagnostic =
 private unterminated(p: *Parser, open: usize, what: string) -> Diagnostic =
     error(p.s.here(), s"$what was never closed").with_label("it opened here")
 
-private control(p: *Parser) -> Diagnostic =
-    error(one(p.s.offset), "a control character may not be written into a string as itself")
+private control(p: *Parser) -> Diagnostic = control_at(p.s.offset)
+
+private control_at(at: usize) -> Diagnostic =
+    error(one(at), "a control character may not be written into a string as itself")
         .with_note("write it as an escape: a tab is `\\t`, and anything else is `\\u00XX`")
 
 // The controls a multi-line string may hold, which is the single-line rule with the line break

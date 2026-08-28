@@ -297,3 +297,64 @@ renders()
 
             assert(text.contains("t.toml"))
             assert(text.contains("b = @"))
+
+// The twelve documents `toml-test` refused to agree with on the first run, each one kept here as the
+// claim it settled. **They are the whole argument for running the corpus**: every one of them passes
+// the tests above, and each was a real defect.
+//
+// The suite cannot vendor 711 files, and it does not need to -- what a corpus buys is finding the
+// case, and what a test buys is keeping it. `toml-test`'s own names are in the comments so that a
+// failure here can be traced back to the file it came from.
+
+@test("a lone carriage return is not a line ending")
+bare_carriage_return()
+    // invalid/control/bare-cr.toml, invalid/control/comment-cr.toml
+    assert(bad("a = 1\r").contains("carriage return"))
+    assert(bad("# a comment with a \r in it\na = 1\n").contains("carriage return"))
+
+    // And CRLF is still an ordinary line ending, which is the half that has to keep working.
+    assert_eq(int_at(ok("a = 1\r\nb = 2\r\n"), "b"), 2)
+
+@test("a byte-order mark opens a document rather than a key")
+byte_order_mark()
+    // valid/utf8-bom-01.toml
+    assert_eq(int_at(ok("\u{feff}a = 1\n"), "a"), 1)
+
+@test("a leading zero is one even with a separator behind it")
+leading_zero_behind_a_separator()
+    // invalid/integer/leading-zero-03.toml, leading-zero-sign-03.toml
+    assert(bad("a = 0_0\n").contains("leading zero"))
+    assert(bad("a = +0_1\n").contains("leading zero"))
+
+@test("a written plus is a sign, so it may not go in front of a radix")
+a_plus_is_a_sign()
+    // invalid/integer/positive-hex.toml, positive-oct.toml, positive-bin.toml
+    assert(bad("a = +0xff\n").contains("sign"))
+    assert(bad("a = +0o755\n").contains("sign"))
+    assert(bad("a = +0b1101\n").contains("sign"))
+
+    // The unsigned forms are the ones that must go on working.
+    assert_eq(int_at(ok("a = 0xff\n"), "a"), 255)
+
+@test("a dotted key may not add to a table written as a value")
+dotted_into_a_written_table()
+    // invalid/inline-table/overwrite-08.toml, duplicate-key-03.toml
+    assert(bad("t = { inner = { dog = \"best\" }, inner.cat = \"worst\" }\n").contains("already a value"))
+
+    // What separates this from the legal case is history, not shape: these two make the same tree.
+    val v = ok("t = { inner.dog = \"best\", inner.cat = \"worst\" }\n")
+
+    assert_eq(v.get("t").unwrap().get("inner").unwrap().len(), 2usize)
+
+@test("an array of tables may not take over a name a header only implied")
+array_over_an_implied_table()
+    // invalid/table/array-implicit.toml -- `[[albums.songs]]` says `albums` is a table, so a later
+    // `[[albums]]` has no reading: a sub-table belongs to the most recently defined element above it.
+    assert(bad("[[albums.songs]]\nname = \"Glory Days\"\n\n[[albums]]\nname = \"Born in the USA\"\n")
+        .contains("already"))
+
+    // The same two headers the other way round are fine, which is what makes this a rule about
+    // order rather than about the pair.
+    val v = ok("[[albums]]\nname = \"Born in the USA\"\n\n[[albums.songs]]\nname = \"Glory Days\"\n")
+
+    assert_eq(v.get("albums").unwrap().len(), 1usize)
