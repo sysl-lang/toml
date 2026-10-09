@@ -8,7 +8,7 @@
 // This is the block a consumer writes to reach it:
 //
 //     dependencies {
-//       toml { git = "github.com/sysl-lang/toml", version = "0.1.0" }
+//       toml { git = "github.com/sysl-lang/toml", version = "0.1.2" }
 //     }
 //
 // The coordinate names the package, `toml`; the module a program imports is `sh.sysl.toml`. Naming
@@ -17,7 +17,7 @@
 
 package {
   name    = "toml"
-  version = "0.1.0"
+  version = "0.1.2"
 
   // The floor is the closure-in-a-`val` release, which is what every `Buf` walk in the reader is
   // written against. Nothing here reaches for a construct newer than that.
@@ -25,7 +25,7 @@ package {
 }
 
 dependencies {
-  parsing { git = "github.com/sysl-lang/parsing", version = "0.5.0" }
+  parsing { git = "github.com/sysl-lang/parsing", version = "0.13.0" }
 }
 
 // **`heap = true`, for the reason json's manifest gives.** A document's size is not known until it
