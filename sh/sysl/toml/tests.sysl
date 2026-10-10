@@ -4,7 +4,7 @@ module sh.sysl.toml
 import sh.sysl.parsing.{Diagnostic, Source, source_of}
 import sysl.buf.{Buf, buf}
 import sysl.math.Float
-import sysl.text.Search
+import sysl.text.{Search, repeat}
 import sysl.time.{day_of, hour_of, minute_of, month_of, second_of, us_of, year_of}
 
 // The document, or a failure naming what went wrong -- so that a test reads as a claim about TOML
@@ -75,6 +75,21 @@ floats()
 float_needs_digits()
     assert(bad("a = 1.\n").contains("digit"))
     assert(bad("a = .5\n").contains("value"))
+
+@test("a float's digits may run past what an integer holds, on either side of its point")
+long_float_digits()
+    val big = "1" + repeat("0", 300)
+    val tiny = "0." + repeat("0", 323) + "5"
+    assert_eq(ok(s"a = ${big}.0\n").get("a").unwrap().as_float().unwrap(), 1e300)
+    assert_eq(ok(s"a = $tiny\n").get("a").unwrap().as_float().unwrap(), 5e-324)
+    assert_eq(ok("a = 0.123456789012345678901\n").get("a").unwrap().as_float().unwrap(), 0.123456789012345678901)
+    assert_eq(ok("a = 1e0_0\n").get("a").unwrap().as_float().unwrap(), 1.0)
+
+@test("an integer too large to hold is still refused, and so is a misplaced separator in a float")
+long_integer_refused()
+    assert(bad("a = 99999999999999999999\n").contains("too large"))
+    assert(bad("a = 1.0__5\n").contains("digit"))
+    assert(bad("a = 1e_5\n").contains("digit"))
 
 @test("an integer and a float are different values")
 int_is_not_float()
