@@ -126,7 +126,7 @@ private number(p: *Parser, sign: int) -> Result[Value, Diagnostic]
                     p.s.skip(2)
 
                     return read_digits(&p.s, base) match
-                        Err(e) -> Err(error(where(e), str(e)))
+                        Err(e) -> Err(error(where(e), e.to_string()))
                         Ok(v) -> Ok(Int(long(v)))
 
                 // A leading zero is a mistake in TOML rather than a radix: `01` is refused, and
@@ -143,9 +143,9 @@ private number(p: *Parser, sign: int) -> Result[Value, Diagnostic]
 
     val whole = read_digits(&p.s, 10) match
         Err(Overflow(s)) ->
-            too_large = Some(error(s, str(Overflow(s))))
+            too_large = Some(error(s, Overflow(s).to_string()))
             0
-        Err(e) -> return Err(error(where(e), str(e)))
+        Err(e) -> return Err(error(where(e), e.to_string()))
         Ok(v) -> v
 
     var real_shaped = false
@@ -159,7 +159,7 @@ private number(p: *Parser, sign: int) -> Result[Value, Diagnostic]
                 real_shaped = true
                 p.s.bump()
                 skip_digits(&p.s, 10) match
-                    Err(e) -> return Err(error(where(e), str(e)))
+                    Err(e) -> return Err(error(where(e), e.to_string()))
                     Ok(_) -> ()
             None -> return Err(error(one(p.s.offset), "a fraction needs a digit after the point"))
 
@@ -171,7 +171,7 @@ private number(p: *Parser, sign: int) -> Result[Value, Diagnostic]
                 p.s.accept(u8('+')) || p.s.accept(u8('-'))
 
                 skip_digits(&p.s, 10) match
-                    Err(er) -> return Err(error(where(er), str(er)))
+                    Err(er) -> return Err(error(where(er), er.to_string()))
                     Ok(_) -> ()
         None -> ()
 
@@ -454,7 +454,7 @@ private escape(p: *Parser) -> Result[char, Diagnostic]
             else
                 read_escape(&p.s) match
                     Ok(ch) -> Ok(ch)
-                    Err(e) -> Err(error(where(e), str(e)))
+                    Err(e) -> Err(error(where(e), e.to_string()))
 end escape
 
 // The toolkit's own fixed-width escape reader, with its refusal reworded for a TOML reader.
@@ -464,7 +464,7 @@ end escape
 private fixed_escape(p: *Parser, n: int, at: usize) -> Result[char, Diagnostic]
     read_hex_escape(&p.s, n, at) match
         Ok(ch) -> Ok(ch)
-        Err(e) -> Err(error(where(e), str(e))
+        Err(e) -> Err(error(where(e), e.to_string())
             .with_note(s"an escape wants $n hexadecimal digits, and a surrogate is not a character"))
 
 /** A multi-line basic string, between `"""`. */
