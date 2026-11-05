@@ -145,8 +145,8 @@ enum Value
             var found: Option[Value] = None
 
             for i in 0..<es.len()
-                if es.at(i).key == key then
-                    found = Some(es.at(i).value)
+                if es[i].key == key then
+                    found = Some(es[i].value)
                     break
 
             found
@@ -154,7 +154,7 @@ enum Value
 
     /** The element at `i`, or `None` where this is not an array or is not that long. */
     at(self, i: usize) -> Option[Value] = self match
-        Arr(xs) -> if i < xs.len() then Some(xs.at(i)) else None
+        Arr(xs) -> if i < xs.len() then Some(xs[i]) else None
         _ -> None
 
     /** Whether a table has this key at all, which `get` cannot be asked without building an

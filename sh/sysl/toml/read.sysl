@@ -211,9 +211,9 @@ private open_table(p: *Parser, parts: Buf[string], open: usize) -> Result[unit, 
     // Every step but the last is walked *into*; the last is what this header defines, so it must
     // not be -- walking into it would take a `[[fruit]]` down to `fruit[0]` and define that twice.
     for i in 0..<(parts.len() - 1)
-        path = walk_into(p, path, parts.at(i), open)?
+        path = walk_into(p, path, parts[i], open)?
 
-    path = extended(path, Key(parts.at(parts.len() - 1)))
+    path = extended(path, Key(parts[parts.len() - 1]))
 
     claim_of(p, path) match
         None -> ()
@@ -237,9 +237,9 @@ private open_array_table(p: *Parser, parts: Buf[string], open: usize) -> Result[
     var path: Buf[Step] = buf()
 
     for i in 0..<(parts.len() - 1)
-        path = walk_into(p, path, parts.at(i), open)?
+        path = walk_into(p, path, parts[i], open)?
 
-    path = extended(path, Key(parts.at(parts.len() - 1)))
+    path = extended(path, Key(parts[parts.len() - 1]))
 
     claim_of(p, path) match
         None -> ()
@@ -311,7 +311,7 @@ private keyval(p: *Parser) -> Result[unit, Diagnostic]
     // reaching through a header's table, or a table already written out, is what the specification
     // refuses.
     for i in 0..<(parts.len() - 1)
-        val next = extended(path, Key(parts.at(i)))
+        val next = extended(path, Key(parts[i]))
 
         claim_of(p, next) match
             None -> set_claim(p, next, Dotted)
@@ -325,7 +325,7 @@ private keyval(p: *Parser) -> Result[unit, Diagnostic]
 
         path = next
 
-    val leaf = extended(path, Key(parts.at(parts.len() - 1)))
+    val leaf = extended(path, Key(parts[parts.len() - 1]))
 
     claim_of(p, leaf) match
         None -> ()
@@ -345,10 +345,10 @@ private freeze(p: *Parser, at: Buf[Step], v: Value)
             set_claim(p, at, Inline)
 
             for i in 0..<es.len()
-                freeze(p, extended(at, Key(es.at(i).key)), es.at(i).value)
+                freeze(p, extended(at, Key(es[i].key)), es[i].value)
         Arr(xs) ->
             for i in 0..<xs.len()
-                freeze(p, extended(at, Index(i)), xs.at(i))
+                freeze(p, extended(at, Index(i)), xs[i])
         _ -> ()
 
 /** A dotted key: one or more simple keys separated by dots, with blanks allowed around each dot. */
@@ -398,14 +398,14 @@ end simple_key
 // tens of tables, and a linear scan over tens is not something a configuration reader can measure.
 private[toml] claim_of(p: *Parser, path: Buf[Step]) -> Option[Claim]
     for i in 0..<p.known.len()
-        if same_path(p.known.at(i).path, path) then return Some(p.known.at(i).claim)
+        if same_path(p.known[i].path, path) then return Some(p.known[i].claim)
 
     None
 
 private[toml] set_claim(p: *Parser, path: Buf[Step], c: Claim)
     for i in 0..<p.known.len()
-        if same_path(p.known.at(i).path, path) then
-            p.known.set(i, Known(path, c))
+        if same_path(p.known[i].path, path) then
+            p.known[i] = Known(path, c)
             return
 
     p.known.push(Known(path, c))
@@ -413,10 +413,10 @@ private[toml] set_claim(p: *Parser, path: Buf[Step], c: Claim)
 // The next index for an array of tables, and the count moved on.
 private bump_count(p: *Parser, path: Buf[Step]) -> usize
     for i in 0..<p.counts.len()
-        if same_path(p.counts.at(i).path, path) then
-            val n = p.counts.at(i).n
+        if same_path(p.counts[i].path, path) then
+            val n = p.counts[i].n
 
-            p.counts.set(i, Count(path, n + 1))
+            p.counts[i] = Count(path, n + 1)
             return n
 
     p.counts.push(Count(path, 1))
@@ -425,7 +425,7 @@ private bump_count(p: *Parser, path: Buf[Step]) -> usize
 // The last element of an array of tables, which is the one a deeper header reaches into.
 private last_index(p: *Parser, path: Buf[Step]) -> usize
     for i in 0..<p.counts.len()
-        if same_path(p.counts.at(i).path, path) then return p.counts.at(i).n - 1
+        if same_path(p.counts[i].path, path) then return p.counts[i].n - 1
 
     0
 
@@ -439,7 +439,7 @@ private[toml] path_text(path: Buf[Step]) -> string
     var b = str_builder()
 
     for i in 0..<path.len()
-        path.at(i) match
+        path[i] match
             Key(name) ->
                 if i > 0 then b.push_char('.')
 

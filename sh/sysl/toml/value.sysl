@@ -684,14 +684,14 @@ private struct Slot
 
 private put(p: *Parser, slots: Buf[Slot], parts: Buf[string], i: usize,
             v: Value, open: usize) -> Result[Buf[Slot], Diagnostic]
-    val name = parts.at(i)
+    val name = parts[i]
     val last = i == parts.len() - 1
 
     var out: Buf[Slot] = buf()
     var placed = false
 
     for k in 0..<slots.len()
-        val slot = slots.at(k)
+        val slot = slots[k]
 
         if slot.key != name then
             out.push(slot)
@@ -722,7 +722,7 @@ private harvest(slots: Buf[Slot]) -> Buf[Entry]
     var out: Buf[Entry] = buf()
 
     for i in 0..<slots.len()
-        val slot = slots.at(i)
+        val slot = slots[i]
 
         slot.written match
             Some(v) -> out.push(Entry(slot.key, v))

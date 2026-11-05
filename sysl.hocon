@@ -8,7 +8,7 @@
 // This is the block a consumer writes to reach it:
 //
 //     dependencies {
-//       toml { git = "github.com/sysl-lang/toml", version = "0.1.4" }
+//       toml { git = "github.com/sysl-lang/toml", version = "0.1.5" }
 //     }
 //
 // The coordinate names the package, `toml`; the module a program imports is `sh.sysl.toml`. Naming
@@ -17,14 +17,14 @@
 
 package {
   name    = "toml"
-  version = "0.1.4"
+  version = "0.1.5"
 
-  // The floor is 0.6.0, which has `.to_string()` on every value the reader formats.
-  sysl = "0.6.0"
+  // The floor is 0.9.0, where `Buf` is indexed with `b[i]` rather than `.at(i)`.
+  sysl = "0.9.0"
 }
 
 dependencies {
-  parsing { git = "github.com/sysl-lang/parsing", version = "0.13.2" }
+  parsing { git = "github.com/sysl-lang/parsing", version = "0.14.1" }
 }
 
 // **`heap = true`, for the reason json's manifest gives.** A document's size is not known until it

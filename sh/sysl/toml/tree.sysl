@@ -136,7 +136,7 @@ private group(nodes: []const Node, depth: usize) -> Value
         val n = nodes[i]
 
         if n.path.len() > depth then
-            val s = n.path.at(depth)
+            val s = n.path[depth]
 
             if s.is_index() then indexed = true
             if !seen(order, s) then order.push(s)
@@ -144,14 +144,14 @@ private group(nodes: []const Node, depth: usize) -> Value
     if indexed then
         var items: Buf[Value] = buf()
 
-        for i in 0..<order.len() do items.push(child(nodes, depth, order.at(i)))
+        for i in 0..<order.len() do items.push(child(nodes, depth, order[i]))
 
         return Arr(items)
 
     var entries: Buf[Entry] = buf()
 
     for i in 0..<order.len()
-        val s = order.at(i)
+        val s = order[i]
 
         s match
             Key(name) -> entries.push(Entry(name, child(nodes, depth, s)))
@@ -167,13 +167,13 @@ private child(nodes: []const Node, depth: usize, s: Step) -> Value
     for i in 0..<nodes.len
         val n = nodes[i]
 
-        if n.path.len() > depth && n.path.at(depth) == s then mine.push(n)
+        if n.path.len() > depth && n.path[depth] == s then mine.push(n)
 
     // A node whose path stops here carries the answer, unless it is the `None` seed a header
     // leaves -- in which case the children are the answer and an empty table is what remains if
     // there are none.
     for i in 0..<mine.len()
-        val n = mine.at(i)
+        val n = mine[i]
 
         if n.path.len() == depth + 1 then
             n.value match
@@ -185,6 +185,6 @@ end child
 
 private seen(order: Buf[Step], s: Step) -> bool
     for i in 0..<order.len()
-        if order.at(i) == s then return true
+        if order[i] == s then return true
 
     false
