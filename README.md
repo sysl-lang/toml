@@ -15,7 +15,7 @@ parse(src) match
 
 ```
 dependencies {
-  toml { git = "github.com/sysl-lang/toml", version = "0.1.5" }
+  toml { git = "github.com/sysl-lang/toml", version = "0.1.6" }
 }
 ```
 

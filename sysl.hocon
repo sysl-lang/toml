@@ -8,7 +8,7 @@
 // This is the block a consumer writes to reach it:
 //
 //     dependencies {
-//       toml { git = "github.com/sysl-lang/toml", version = "0.1.5" }
+//       toml { git = "github.com/sysl-lang/toml", version = "0.1.6" }
 //     }
 //
 // The coordinate names the package, `toml`; the module a program imports is `sh.sysl.toml`. Naming
@@ -17,7 +17,7 @@
 
 package {
   name    = "toml"
-  version = "0.1.5"
+  version = "0.1.6"
 
   // The floor is 0.10.0, where the time types are `Date`, `Time` and `DateTime`.
   sysl = "0.10.0"
