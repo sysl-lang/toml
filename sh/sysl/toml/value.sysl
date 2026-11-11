@@ -4,7 +4,7 @@ import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
 import sysl.math.Float
 import sysl.text.{Ascii, char_from_u32, from_utf8_unchecked, parse_real, str_builder}
-import sysl.time.{LocalDate, LocalTime, LocalDateTime, Offset, date_at, days_in_month}
+import sysl.time.{Date, Time, DateTime, Offset, date, days_in_month}
 
 // The value grammar: nine shapes, and the four of them that are dates.
 //
@@ -252,7 +252,7 @@ private datetime(p: *Parser) -> Result[Value, Diagnostic]
     if !joined then return Ok(Date(d))
 
     val t = time_part(p)?
-    val dt = LocalDateTime(d, t)
+    val dt = DateTime(d, t)
 
     p.s.peek() match
         None -> Ok(DateTime(dt))
@@ -282,7 +282,7 @@ private datetime(p: *Parser) -> Result[Value, Diagnostic]
                 Ok(DateTime(dt))
 end datetime
 
-private date_part(p: *Parser) -> Result[LocalDate, Diagnostic]
+private date_part(p: *Parser) -> Result[Date, Diagnostic]
     val at = p.s.offset
     val y = fixed(p, 4)?
 
@@ -298,10 +298,10 @@ private date_part(p: *Parser) -> Result[LocalDate, Diagnostic]
     if d < 1 || d > days_in_month(y, m) then
         return Err(error(Span(at, p.s.offset), s"$y-$m has no day $d"))
 
-    Ok(date_at(y, m, d))
+    Ok(date(y, m, d))
 end date_part
 
-private time_part(p: *Parser) -> Result[LocalTime, Diagnostic]
+private time_part(p: *Parser) -> Result[Time, Diagnostic]
     val at = p.s.offset
     val h = fixed(p, 2)?
 
@@ -349,7 +349,7 @@ private time_part(p: *Parser) -> Result[LocalTime, Diagnostic]
 
     val whole = long(h) * 3600000000 + long(mi) * 60000000 + long(if sec == 60 then 59 else sec) * 1000000
 
-    Ok(LocalTime(whole + us))
+    Ok(Time(whole + us))
 end time_part
 
 // Exactly `n` digits, which is what every field of a date is. A short run is the document's mistake

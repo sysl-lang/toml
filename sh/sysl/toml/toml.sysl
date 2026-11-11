@@ -1,7 +1,7 @@
 module sh.sysl.toml
 
 import sysl.buf.{Buf, buf}
-import sysl.time.{LocalDate, LocalTime, LocalDateTime, Offset}
+import sysl.time.{Date, Time, DateTime, Offset}
 
 // The value, and the two things a caller does with one that a `match` does not do well: ask what it
 // is, and reach into it by name or by position.
@@ -49,10 +49,10 @@ enum Value
     Int(n: long)
     Float(x: real)
     Bool(b: bool)
-    OffsetDateTime(dt: LocalDateTime, offset: Offset)
-    DateTime(dt: LocalDateTime)
-    Date(d: LocalDate)
-    Time(t: LocalTime)
+    OffsetDateTime(dt: DateTime, offset: Offset)
+    DateTime(dt: DateTime)
+    Date(d: Date)
+    Time(t: Time)
     Arr(items: Buf[Value])
     Table(entries: Buf[Entry])
 
